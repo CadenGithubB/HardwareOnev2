@@ -4,6 +4,8 @@
 // Forward declarations
 String getCommonCSS();
 String generateNavigation(const String& activePage, const String& username);
+String generatePublicNavigation();
+String htmlPublicShellWithNav(const String& inner);
 
 String htmlPage(const String& body) {
   return String(
@@ -51,6 +53,8 @@ String getCommonCSS() {
     "a:hover{text-decoration:underline}"
     "input,select,textarea{width:100%;padding:.5rem;border:1px solid #ddd;"
     "border-radius:4px;margin-bottom:.5rem}"
+    /* taller input utility to visually match .btn height */
+    ".input-tall{min-height:40px;padding:.5rem .6rem}"
     /* generic native buttons, but do NOT override our .btn components */
     "button:not(.menu-item):not(.btn){background:#007bff;color:#fff;border:none;padding:.5rem 1rem;"
     "border-radius:4px;cursor:pointer}"
@@ -72,6 +76,9 @@ String getCommonCSS() {
     ".text-primary{color:#0d6efd}"
     ".text-sm{font-size:.9rem}"
     ".link-primary{color:#0d6efd}"
+    /* --- Utilities: Visibility --- */
+    ".vis-hidden{visibility:hidden!important}"
+    ".vis-gone{display:none!important}"
     /* --- Utilities: Spacing --- */
     ".space-top-sm{margin-top:8px}"
     ".space-top-md{margin-top:16px}"
@@ -99,8 +106,12 @@ String getCommonCSS() {
     ".form-input{width:100%;padding:.6rem;border:1px solid #ced4da;border-radius:6px;background:#fff;color:#333}"
     ".form-error{margin-bottom:.5rem}"
     /* --- Buttons (unified) --- */
-    ".btn{display:inline-block;padding:.5rem 1rem;border-radius:8px;border:1px solid rgba(0,0,0,.2);"
-    "background:rgba(255,255,255,.9);color:#333;text-decoration:none;cursor:pointer;transition:all .2s}"
+    ".btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;"
+    "padding:.5rem 1rem;border-radius:8px;border:1px solid rgba(0,0,0,.2);"
+    "background:rgba(255,255,255,.9);color:#333;text-decoration:none;cursor:pointer;transition:all .2s;"
+    "font-size:1rem;line-height:1.2;font-weight:500;box-sizing:border-box}"
+    "button.btn,a.btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;"
+    "font-size:1rem;line-height:1.2;font-weight:500}"
     ".btn:hover{transform:translateY(-1px);box-shadow:0 2px 6px rgba(0,0,0,.12);background:rgba(255,255,255,.95)}"
     /* semantic aliases share the same base look */
     ".btn-primary,.btn-secondary{ }"
@@ -116,14 +127,32 @@ String getCommonCSS() {
     ;
 }
 
+// Public page shell - minimal navigation with only login
+String htmlPublicShellWithNav(const String& inner) {
+  String h;
+  h += "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>HardwareOne - Minimal</title><style>"; h += getCommonCSS(); h += "</style></head><body>";
+  h += generatePublicNavigation();
+  h += "<div class='content'><div class='card'>"; h += inner; h += "</div></div>";
+  h += "</body></html>";
+  return h;
+}
+
+// Authenticated page shell - full navigation
 String htmlShellWithNav(const String& username, const String& activePage, const String& inner) {
   String h;
   h += "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   h += "<title>HardwareOne - Minimal</title><style>"; h += getCommonCSS(); h += "</style></head><body>";
   h += generateNavigation(activePage, username);
   h += "<div class='content'><div class='card'>"; h += inner; h += "</div></div>";
-  // Global, lightweight SSE for broadcast/notice (e.g., revoke)
-  h += "<script>(function(){try{ if(!window.EventSource) return; if(window.__es) return; var es=new EventSource('/api/events', { withCredentials: true }); es.addEventListener('notice', function(e){ try{ var d=null; try{ d=JSON.parse(e.data||'{}'); }catch(_){ d=null; } if(d&&d.msg){ try{ alert(d.msg); }catch(_){ console.log('[NOTICE]', d.msg); } if(d.type==='revoke'){ try{ window.location.href='/login'; }catch(_){ } } } } catch(_){ } }); es.onerror=function(){ try{ es.close(); }catch(_){ } window.__es=null; }; window.__es=es; document.addEventListener('visibilitychange', function(){ try{ if(document.hidden){ if(window.__es){ window.__es.close(); window.__es=null; } } else { if(!window.__es){ try{ var es2=new EventSource('/api/events', { withCredentials: true }); es2.addEventListener('notice', function(e){ try{ var d=null; try{ d=JSON.parse(e.data||'{}'); }catch(_){ d=null; } if(d&&d.msg){ try{ alert(d.msg); }catch(_){ console.log('[NOTICE]', d.msg); } if(d.type==='revoke'){ try{ window.location.href='/login'; }catch(_){ } } } } catch(_){ } }); es2.onerror=function(){ try{ es2.close(); }catch(_){ } window.__es=null; }; window.__es=es2; }catch(_){ } } } }catch(_){ } }); }catch(_){ } })();</script>";
+  // Global SSE for server-driven broadcast/notice popups (enabled by default)
+  h += "<script>(function(){try{ if(typeof window.ENABLE_SSE==='undefined'){ window.ENABLE_SSE=true; } if(!window.ENABLE_SSE) return; if(!window.EventSource) return; var attachNotice=function(es){ try{ es.addEventListener('notice', function(e){ try{ var d=null; try{ d=JSON.parse(e.data||'{}'); }catch(_){ d=null; } if(d&&d.msg){ if(d.msg.indexOf('[revoke]')===0){ try{ if(window.__es){ window.__es.close(); window.__es=null; } document.cookie='session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'; sessionStorage.setItem('revokeMsg', d.msg); document.body.innerHTML='<div style=\"text-align:center;padding:50px;font-family:Arial,sans-serif\"><h2>Session Revoked</h2><p>Redirecting to login...</p></div>'; setTimeout(function(){ window.location.replace('/login'); }, 1000); }catch(_){ window.location.href='/login'; } } else { try{ alert(d.msg); }catch(_){ console.log('[NOTICE]', d.msg); } } } } catch(_){ } }); }catch(_){ } }; var ensureES=function(){ try{ var es=window.__es; if(es && es.readyState===1){ attachNotice(es); return; } if(es){ try{ es.close(); }catch(_){ } } es = new EventSource('/api/events', { withCredentials: true }); window.__es = es; attachNotice(es); es.onopen=function(){ try{ console.log('[SSE] connected'); }catch(_){ } }; es.onerror=function(){ try{ console.log('[SSE] error (auto-reconnect)'); }catch(_){ } /* let browser auto-reconnect */ }; }catch(_){ } }; ensureES(); try{ setInterval(ensureES, 2000); }catch(_){ } }catch(_){ } })();</script>";
+  // Proactively close SSE on navigation/unload to free server resources quickly
+  h += "<script>(function(){ try{ function closeES(){ try{ if(window.__es){ window.__es.close(); window.__es=null; } }catch(_){ } } window.addEventListener('beforeunload', closeES, {capture:true}); window.addEventListener('pagehide', closeES, {capture:true}); document.addEventListener('click', function(ev){ try{ var a=ev.target; while(a && a.tagName!=='A'){ a=a.parentElement; } if(!a) return; var href=a.getAttribute('href'); if(!href) return; if(href.indexOf('#')===0) return; /* ignore in-page anchors */ closeES(); }catch(_){ } }, {capture:true}); }catch(_){ } })();</script>";
+  // One-shot status hydration on page load (no persistent SSE needed)
+  h += "<script>(function(){ try{ fetch('/api/sensors/status',{cache:'no-store', credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){ if(j && typeof window.applySensorStatus==='function'){ try{ window.applySensorStatus(j); }catch(_){ } } }).catch(function(_){ }); }catch(_){ } })();</script>";
+  // Polling fallback for session revocation (every 2 seconds for faster detection)
+  h += "<script>(function(){ try{ var checkRevoke=function(){ try{ fetch('/api/notice',{cache:'no-store',credentials:'same-origin'}).then(function(r){ if(r.status===401){ console.log('[REVOKE] Got 401, session likely revoked'); sessionStorage.setItem('revokeMsg', '[revoke] Your session has been revoked by an administrator.'); document.body.innerHTML='<div style=\"text-align:center;padding:50px;font-family:Arial,sans-serif\"><h2>Session Revoked</h2><p>Redirecting to login...</p></div>'; setTimeout(function(){ window.location.replace('/login'); }, 1000); return; } return r.json(); }).then(function(d){ if(d&&d.notice&&d.notice.indexOf('[revoke]')===0){ console.log('[REVOKE] Got revoke notice:', d.notice); try{ if(window.__es){ window.__es.close(); window.__es=null; } document.cookie='session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'; sessionStorage.setItem('revokeMsg', d.notice); document.body.innerHTML='<div style=\"text-align:center;padding:50px;font-family:Arial,sans-serif\"><h2>Session Revoked</h2><p>Redirecting to login...</p></div>'; setTimeout(function(){ window.location.replace('/login'); }, 1000); }catch(_){ window.location.href='/login'; } } }).catch(function(e){ if(e.message&&e.message.indexOf('401')!==-1){ console.log('[REVOKE] Fetch failed with 401'); sessionStorage.setItem('revokeMsg', '[revoke] Your session has been revoked.'); document.body.innerHTML='<div style=\"text-align:center;padding:50px;font-family:Arial,sans-serif\"><h2>Session Revoked</h2><p>Redirecting to login...</p></div>'; setTimeout(function(){ window.location.replace('/login'); }, 1000); } }); }catch(_){} }; setInterval(checkRevoke, 2000); }catch(_){} })();</script>";
   h += "</body></html>";
   return h;
 }
