@@ -1,0 +1,8 @@
+{
+  "name": "Test Morning Greeting",
+  "type": "atTime",
+  "atTime": "08:00",
+  "days": "1234567",
+  "command": "broadcast Good morning from GitHub automation!",
+  "enabled": true
+}
