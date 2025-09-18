@@ -18,7 +18,7 @@ String getAutomationsPage(const String& username) {
   inner += "<div id='download_status' style='margin-top:0.5rem;font-size:0.9em'></div>";
   inner += "<details style='margin-top:0.5rem'>";
   inner += "<summary style='cursor:pointer;color:#007bff'>ℹ️ How to use</summary>";
-  inner += "<div style='margin-top:0.5rem;padding:0.5rem;background:#fff;border-radius:4px;font-size:0.9em'>";
+  inner += "<div style='margin-top:0.5rem;padding:0.5rem;background:#fff;border-radius:4px;font-size:0.9em;color:#000'>";
   inner += "<p><strong>Steps:</strong></p>";
   inner += "<ol>";
   inner += "<li>Find an automation JSON file on GitHub</li>";

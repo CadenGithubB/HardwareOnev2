@@ -10866,6 +10866,7 @@ static String processCommand(const String& cmd) {
 
     // ---- Automations ----
     { "automation", "Automation list/add/enable/disable/delete/run.", true },
+    { "downloadautomation", "Download automation from GitHub: downloadautomation url=<github-raw-url> [name=<custom-name>].", true },
 
     // ---- Users / Admin (Admin Controls section on Settings page) ----
     { "user approve", "Approve pending user.", true },
