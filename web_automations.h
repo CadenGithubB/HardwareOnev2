@@ -29,7 +29,7 @@ String getAutomationsPage(const String& username) {
   inner += "<pre style='background:#f8f9fa;padding:0.5rem;border-radius:4px;font-size:0.8em'>{";
   inner += "\\n  \"name\": \"Morning Lights\",";
   inner += "\\n  \"type\": \"atTime\",";
-  inner += "\\n  \"atTime\": \"07:00\",";
+  inner += "\\n  \"time\": \"07:00\",";
   inner += "\\n  \"days\": \"1234567\",";
   inner += "\\n  \"command\": \"broadcast Good morning!\",";
   inner += "\\n  \"enabled\": true";

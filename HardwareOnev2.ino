@@ -6177,35 +6177,167 @@ static String cmd_downloadautomation(const String& originalCmd) {
     return "Usage: downloadautomation url=<github-raw-url> [name=<automation-name>]";
   }
   
+  // URL decode the URL parameter (it gets double-encoded from web interface)
+  url.replace("%3A", ":");
+  url.replace("%2F", "/");
+  url.replace("%3F", "?");
+  url.replace("%3D", "=");
+  url.replace("%26", "&");
+  url.replace("%25", "%"); // Do this last to avoid double-decoding
+  
+  broadcastOutput("Original URL after decoding: " + url);
+  
   // Convert GitHub URLs to raw format if needed
   if (url.indexOf("github.com") >= 0 && url.indexOf("raw.githubusercontent.com") < 0) {
+    broadcastOutput("Converting GitHub blob URL to raw format...");
     // Convert https://github.com/user/repo/blob/main/file.json to raw format
     url.replace("github.com", "raw.githubusercontent.com");
     url.replace("/blob/", "/");
+    broadcastOutput("Converted URL: " + url);
   }
   
-  broadcastOutput("Downloading automation from: " + url);
+  broadcastOutput("Final URL for download: " + url);
   
-  WiFiClientSecure client;
-  client.setInsecure(); // For simplicity, skip certificate validation
-  HTTPClient http;
+  // Use a separate task with larger stack for HTTP operations to avoid stack overflow
+  struct DownloadTaskParams {
+    String url;
+    String* result;
+    bool* completed;
+    SemaphoreHandle_t semaphore;
+  };
   
-  if (!http.begin(client, url)) {
-    return "Error: Failed to initialize HTTP client";
-  }
+  String downloadResult;
+  bool downloadCompleted = false;
+  SemaphoreHandle_t downloadSemaphore = xSemaphoreCreateBinary();
   
-  http.setTimeout(10000); // 10 second timeout
-  http.addHeader("User-Agent", "ESP32-QtPy-Automation-Downloader");
+  DownloadTaskParams params = {url, &downloadResult, &downloadCompleted, downloadSemaphore};
   
-  int httpCode = http.GET();
-  
-  if (httpCode != HTTP_CODE_OK) {
+  auto downloadTask = [](void* pvParameters) {
+    DownloadTaskParams* p = (DownloadTaskParams*)pvParameters;
+    
+    UBaseType_t stackStart = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("Download task started - Stack available: %d bytes", stackStart);
+    
+    WiFiClientSecure client;
+    UBaseType_t stackAfterClient = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("After WiFiClientSecure creation - Stack available: %d bytes (used: %d)", 
+               stackAfterClient, stackStart - stackAfterClient);
+    
+    client.setInsecure(); // For simplicity, skip certificate validation
+    
+    HTTPClient http;
+    UBaseType_t stackAfterHttp = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("After HTTPClient creation - Stack available: %d bytes (used: %d)", 
+               stackAfterHttp, stackAfterClient - stackAfterHttp);
+    
+    DEBUG_SSEF("Initializing HTTP client for URL: %s", p->url.c_str());
+    
+    // Try to resolve the hostname first
+    String hostname = "raw.githubusercontent.com";
+    IPAddress ip;
+    if (WiFi.hostByName(hostname.c_str(), ip)) {
+      DEBUG_SSEF("DNS resolution successful: %s -> %s", hostname.c_str(), ip.toString().c_str());
+    } else {
+      DEBUG_SSEF("DNS resolution failed for: %s", hostname.c_str());
+    }
+    
+    if (!http.begin(client, p->url)) {
+      UBaseType_t stackAfterBegin = uxTaskGetStackHighWaterMark(NULL);
+      DEBUG_SSEF("HTTP begin failed - Stack available: %d bytes", stackAfterBegin);
+      *(p->result) = "Error: Failed to initialize HTTP client";
+      *(p->completed) = true;
+      xSemaphoreGive(p->semaphore);
+      vTaskDelete(NULL);
+      return;
+    }
+    
+    UBaseType_t stackAfterBegin = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("After HTTP begin - Stack available: %d bytes (used: %d)", 
+               stackAfterBegin, stackAfterHttp - stackAfterBegin);
+    
+    http.setTimeout(10000); // 10 second timeout
+    http.addHeader("User-Agent", "ESP32-QtPy-Automation-Downloader");
+    
+    UBaseType_t stackBeforeGet = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("Before HTTP GET - Stack available: %d bytes", stackBeforeGet);
+    
+    int httpCode = http.GET();
+    
+    UBaseType_t stackAfterGet = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("After HTTP GET - Stack available: %d bytes (used: %d), HTTP code: %d", 
+               stackAfterGet, stackBeforeGet - stackAfterGet, httpCode);
+    
+    // Get response headers for debugging
+    String location = http.header("Location");
+    String contentType = http.header("Content-Type");
+    String server = http.header("Server");
+    DEBUG_SSEF("Response headers - Location: '%s', Content-Type: '%s', Server: '%s'", 
+               location.c_str(), contentType.c_str(), server.c_str());
+    
+    if (httpCode != HTTP_CODE_OK) {
+      // Get the error response body for more info
+      String errorBody = http.getString();
+      DEBUG_SSEF("HTTP error response body: '%s'", errorBody.c_str());
+      http.end();
+      *(p->result) = "Error: HTTP " + String(httpCode) + " - " + errorBody;
+      *(p->completed) = true;
+      xSemaphoreGive(p->semaphore);
+      vTaskDelete(NULL);
+      return;
+    }
+    
+    DEBUG_SSEF("Getting response payload - Stack available: %d bytes", uxTaskGetStackHighWaterMark(NULL));
+    
+    String payload = http.getString();
+    
+    UBaseType_t stackAfterPayload = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("After getString - Stack available: %d bytes, payload size: %d bytes", 
+               stackAfterPayload, payload.length());
+    
     http.end();
-    return "Error: HTTP " + String(httpCode) + " - Failed to download automation";
+    
+    UBaseType_t stackFinal = uxTaskGetStackHighWaterMark(NULL);
+    DEBUG_SSEF("Download completed - Final stack available: %d bytes, total used: %d bytes", 
+               stackFinal, stackStart - stackFinal);
+    
+    *(p->result) = payload;
+    *(p->completed) = true;
+    xSemaphoreGive(p->semaphore);
+    vTaskDelete(NULL);
+  };
+  
+  // Create task with 16KB stack (same as thermal sensor init)
+  TaskHandle_t downloadTaskHandle;
+  BaseType_t taskResult = xTaskCreate(
+    downloadTask,
+    "DownloadAutomation",
+    16384, // 16KB stack
+    &params,
+    1, // Priority
+    &downloadTaskHandle
+  );
+  
+  if (taskResult != pdPASS) {
+    vSemaphoreDelete(downloadSemaphore);
+    return "Error: Failed to create download task";
   }
   
-  String payload = http.getString();
-  http.end();
+  DEBUG_SSEF("Download task created, waiting for completion");
+  
+  // Wait for download to complete (max 15 seconds)
+  if (xSemaphoreTake(downloadSemaphore, pdMS_TO_TICKS(15000)) != pdTRUE) {
+    vTaskDelete(downloadTaskHandle);
+    vSemaphoreDelete(downloadSemaphore);
+    return "Error: Download timeout";
+  }
+  
+  vSemaphoreDelete(downloadSemaphore);
+  
+  if (!downloadCompleted) {
+    return "Error: Download task failed to complete";
+  }
+  
+  String payload = downloadResult;
   
   if (payload.length() == 0) {
     return "Error: Downloaded content is empty";
@@ -6293,10 +6425,10 @@ static String cmd_downloadautomation(const String& originalCmd) {
   String autoName = extractJsonValue("name");
   String autoType = extractJsonValue("type");
   String enabled = extractJsonValue("enabled");
-  String atTime = extractJsonValue("atTime");
+  String atTime = extractJsonValue("time");  // Look for 'time' field
   String days = extractJsonValue("days");
   String command = extractJsonValue("command");
-  String afterDelay = extractJsonValue("afterDelay");
+  String afterDelay = extractJsonValue("delay");  // Look for 'delay' field
   String interval = extractJsonValue("interval");
   
   if (autoName.length() == 0) autoName = name.length() > 0 ? name : "Downloaded Automation";
@@ -6307,9 +6439,9 @@ static String cmd_downloadautomation(const String& originalCmd) {
   addCmd += "name=\"" + autoName + "\" type=" + autoType + " command=\"" + command + "\"";
   
   if (enabled.length() > 0) addCmd += " enabled=" + enabled;
-  if (atTime.length() > 0) addCmd += " atTime=" + atTime;
+  if (atTime.length() > 0) addCmd += " time=" + atTime;  // Use 'time=' not 'atTime='
   if (days.length() > 0) addCmd += " days=" + days;
-  if (afterDelay.length() > 0) addCmd += " afterDelay=" + afterDelay;
+  if (afterDelay.length() > 0) addCmd += " delay=" + afterDelay;  // Use 'delay=' not 'afterDelay='
   if (interval.length() > 0) addCmd += " interval=" + interval;
   
   broadcastOutput("Executing: " + addCmd);
