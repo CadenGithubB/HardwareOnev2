@@ -1,8 +1,14 @@
 {
-  "name": "Daily System Health Report",
-  "type": "atTime", 
-  "time": "09:30",
-  "days": "1234567",
-  "command": "status && memory && psram && fsusage && wifiinfo && uptime && broadcast 📊 Daily system health report completed! All systems operational.",
+  "name": "Complex System Report",
+  "type": "atTime",
+  "time": "09:00", 
+  "days": "12345",
+  "commands": [
+    "broadcast Starting comprehensive system report...",
+    "status",
+    "memory",
+    "fsusage", 
+    "broadcast System report complete - all checks passed!"
+  ],
   "enabled": true
 }
