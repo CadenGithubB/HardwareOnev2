@@ -1,14 +1,8 @@
-broadcast === AUTOMATED SYSTEM REPORT ===
-status
-memory
-psram
-fsusage
-wifiinfo
-uptime
-broadcast WiFi: Connected to network with strong signal
-broadcast Memory: System has adequate free heap and PSRAM
-broadcast Storage: Filesystem usage within normal parameters  
-broadcast Sensors: All sensor systems operational
-broadcast Uptime: Device has been running stably
-broadcast === END SYSTEM REPORT ===
-broadcast Report generated automatically from GitHub automation
+{
+  "name": "Daily System Health Report",
+  "type": "atTime", 
+  "time": "09:30",
+  "days": "1234567",
+  "command": "status && memory && psram && fsusage && wifiinfo && uptime && broadcast 📊 Daily system health report completed! All systems operational.",
+  "enabled": true
+}
