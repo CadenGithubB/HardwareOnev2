@@ -1,0 +1,9 @@
+{
+  "id": 611422,
+  "name": "test",
+  "enabled": true,
+  "type": "attime",
+  "time": "11:01",
+  "commands": ["status"],
+  "nextAt": 1758466860
+}
