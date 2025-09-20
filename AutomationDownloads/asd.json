@@ -1,0 +1,10 @@
+{
+  "name": "asd",
+  "type": "atTime",
+  "time": "01:01",
+  "commands": [
+    "status"
+  ],
+  "conditions": "IF temp>65 THEN ledcolor red",
+  "enabled": true
+}
