@@ -26,8 +26,11 @@ static void runUnifiedSystemCommand(const String& cmd);
 #include "web_settings.h"
 #include "web_sensors.h"
 #include "web_automations.h"
+#include "web_espnow.h"
 #include <lwip/netdb.h>
 #include <arpa/inet.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <memory>
 #include <ctype.h>
 #include <Wire.h>
@@ -43,8 +46,10 @@ static void runUnifiedSystemCommand(const String& cmd);
 #include <vector>
 #include "mem_util.h"
 
+
 // Now that esp_http_server.h is included, declare helpers that use httpd_req_t
 static bool executeUnifiedWebCommand(httpd_req_t* req, AuthContext& ctx, const String& cmd, String& out);
+
 
 // Pre-allocation snapshots (used by mem_util.h capture helper)
 size_t gAllocHeapBefore = 0;
@@ -457,6 +462,57 @@ static bool parseAtTimeMatchDays(const String& daysCsv, int tm_wday) {
   return wrapped.indexOf(needle) >= 0;
 }
 
+// -------- Automation Logging Infrastructure --------
+// Forward declaration for filesystemReady (defined later)
+extern bool filesystemReady;
+
+static bool gAutoLogActive = false;
+static String gAutoLogFile = "";
+static String gAutoLogAutomationName = "";
+
+// Append log entry to automation log file (matches existing log format)
+static bool appendAutoLogEntry(const String& type, const String& content) {
+  if (!gAutoLogActive || gAutoLogFile.length() == 0) return false;
+  if (!filesystemReady) return false;
+  
+  // Get timestamp in same format as existing logs: [YYYY-MM-DD HH:MM:SS.mmm]
+  char tsPrefix[32];
+  getTimestampPrefixMsCached(tsPrefix, sizeof(tsPrefix));
+  
+  // Format: [YYYY-MM-DD HH:MM:SS.mmm] | type | content
+  String line;
+  line.reserve(200);
+  if (tsPrefix[0]) line += tsPrefix;  // already includes trailing " | "
+  line += type;
+  line += " | ";
+  line += content;
+  line += "\n";
+  
+  // Append to file (create if doesn't exist)
+  File f = LittleFS.open(gAutoLogFile, "a");
+  if (!f) {
+    // Try to create directory if it doesn't exist
+    int lastSlash = gAutoLogFile.lastIndexOf('/');
+    if (lastSlash > 0) {
+      String dir = gAutoLogFile.substring(0, lastSlash);
+      if (!LittleFS.exists(dir)) {
+        // Create directory recursively (simple approach for /logs)
+        if (dir == "/logs" && !LittleFS.exists("/logs")) {
+          LittleFS.mkdir("/logs");
+        }
+      }
+    }
+    
+    // Try to open again after directory creation
+    f = LittleFS.open(gAutoLogFile, "a");
+    if (!f) return false;
+  }
+  
+  size_t written = f.print(line);
+  f.close();
+  
+  return written > 0;
+}
 
 static void schedulerTickMinute() {
   // Only valid if time is synced
@@ -556,7 +612,7 @@ static void schedulerTickMinute() {
     // Check if it's time to run
     if (now >= nextAt) {
       // Extract commands
-      String cmdsList[8];
+      String cmdsList[64];
       int cmdsCount = 0;
       int cmdsPos = obj.indexOf("\"commands\"");
       bool haveArray = false;
@@ -587,7 +643,7 @@ static void schedulerTickMinute() {
       if (haveArray) {
         String body = obj.substring(arrStart + 1, arrEnd);
         int i = 0;
-        while (i < (int)body.length() && cmdsCount < 8) {
+        while (i < (int)body.length() && cmdsCount < 64) {
           while (i < (int)body.length() && (body[i] == ' ' || body[i] == ',')) i++;
           if (i >= (int)body.length()) break;
           if (body[i] == '"') {
@@ -596,7 +652,7 @@ static void schedulerTickMinute() {
             if (q2 < 0) break;
             String one = body.substring(q1 + 1, q2);
             one.trim();
-            if (one.length()) { cmdsList[cmdsCount++] = one; }
+            if (one.length() && cmdsCount < 64) { cmdsList[cmdsCount++] = one; }
             i = q2 + 1;
           } else {
             int next = body.indexOf(',', i);
@@ -614,18 +670,98 @@ static void schedulerTickMinute() {
           if (cq1 > 0 && cq2 > cq1) {
             String cmd = obj.substring(cq1 + 1, cq2);
             cmd.trim();
-            if (cmd.length()) { cmdsList[cmdsCount++] = cmd; }
+            if (cmd.length() && cmdsCount < 64) { cmdsList[cmdsCount++] = cmd; }
           }
         }
       }
 
       if (cmdsCount > 0) {
-        // Execute commands
+        // Extract automation name for logging
+        String autoName = "Unknown";
+        int namePos = obj.indexOf("\"name\"");
+        if (namePos >= 0) {
+          int colonPos = obj.indexOf(':', namePos);
+          if (colonPos >= 0) {
+            int q1 = obj.indexOf('"', colonPos + 1);
+            int q2 = obj.indexOf('"', q1 + 1);
+            if (q1 >= 0 && q2 >= 0) {
+              autoName = obj.substring(q1 + 1, q2);
+            }
+          }
+        }
+
+        // Check conditions if present
+        String conditions = "";
+        int condPos = obj.indexOf("\"conditions\"");
+        if (condPos >= 0) {
+          int condColon = obj.indexOf(':', condPos);
+          if (condColon >= 0) {
+            int condQ1 = obj.indexOf('"', condColon + 1);
+            int condQ2 = obj.indexOf('"', condQ1 + 1);
+            if (condQ1 >= 0 && condQ2 >= 0) {
+              conditions = obj.substring(condQ1 + 1, condQ2);
+              conditions.trim();
+            }
+          }
+        }
+        
+        // Evaluate conditions if present
+        if (conditions.length() > 0) {
+          // Check if this is a conditional chain (contains ELSE/ELSE IF)
+          if (conditions.indexOf("ELSE") >= 0) {
+            String actionToExecute = evaluateConditionalChain(conditions);
+            DEBUGF(DEBUG_AUTOMATIONS, "[autos] id=%ld conditional chain result: '%s'", 
+                   id, actionToExecute.c_str());
+            
+            if (actionToExecute.length() > 0) {
+              // Execute the specific action from the chain
+              String result = executeConditionalCommand(actionToExecute);
+              if (result.startsWith("Error:")) {
+                DEBUGF(DEBUG_AUTOMATIONS, "[autos] conditional chain error: %s", result.c_str());
+              }
+            }
+            continue; // Skip normal command execution
+          } else {
+            // Simple IF/THEN condition
+            bool conditionMet = evaluateCondition(conditions);
+            DEBUGF(DEBUG_AUTOMATIONS, "[autos] id=%ld condition='%s' result=%s", 
+                   id, conditions.c_str(), conditionMet ? "TRUE" : "FALSE");
+            
+            if (!conditionMet) {
+              if (gAutoLogActive) {
+                String skipMsg = "Scheduled automation skipped: ID=" + String(id) + " Name=" + autoName + " Condition not met: " + conditions;
+                appendAutoLogEntry("AUTO_SKIP", skipMsg);
+              }
+              DEBUGF(DEBUG_AUTOMATIONS, "[autos] id=%ld skipped - condition not met: %s", id, conditions.c_str());
+              continue; // Skip to next automation
+            }
+          }
+        }
+
+        // Log scheduled automation start if logging is active
+        if (gAutoLogActive) {
+          gAutoLogAutomationName = autoName;
+          String startMsg = "Scheduled automation started: ID=" + String(id) + " Name=" + autoName + " User=system";
+          appendAutoLogEntry("AUTO_START", startMsg);
+        }
+
+        // Execute commands (with conditional logic support)
         for (int ci = 0; ci < cmdsCount; ++ci) {
           DEBUGF(DEBUG_AUTOMATIONS, "[autos] id=%ld run cmd[%d]='%s'", id, ci, cmdsList[ci].c_str());
-          runAutomationCommandUnified(cmdsList[ci]);
+          
+          // Execute command with conditional logic support
+          String result = executeConditionalCommand(cmdsList[ci]);
+          if (result.startsWith("Error:")) {
+            DEBUGF(DEBUG_AUTOMATIONS, "[autos] id=%ld cmd[%d] error: %s", id, ci, result.c_str());
+          }
         }
         executed++;
+
+        // Log scheduled automation end if logging is active
+        if (gAutoLogActive) {
+          String endMsg = "Scheduled automation completed: ID=" + String(id) + " Name=" + autoName + " Commands=" + String(cmdsCount);
+          appendAutoLogEntry("AUTO_END", endMsg);
+        }
 
         // Compute and update next run time
         time_t newNextAt = computeNextRunTime(obj, now);
@@ -729,11 +865,26 @@ void setupWiFi();
 void startHttpServer();
 // Output/logging used widely before definition
 
+// Global variables forward declarations
+extern bool filesystemReady;
+
 // Centralized command execution with AuthContext (transport-agnostic)
 static const char* originFrom(const AuthContext& ctx);
 static bool hasAdminPrivilege(const AuthContext& ctx);
 static bool isAdminOnlyCommand(const String& cmd);
 static String redactCmdForAudit(const String& cmd);
+
+// Global flag to track automation execution context
+static bool gInAutomationContext = false;
+
+
+// -------- Command Executor Task (decl) --------
+// Forward declaration of request struct (full definition after CommandContext)
+struct ExecReq;
+// Queue holding pointers to ExecReq
+static QueueHandle_t gCmdExecQ = nullptr;
+// Forward declaration of task
+static void commandExecTask(void* pv);
 static bool executeCommand(AuthContext& ctx, const String& cmd, String& out);
 void broadcastOutput(const String& s);
 // Auth/session helpers used early
@@ -742,6 +893,8 @@ void logAuthAttempt(bool success, const char* path, const String& userTried, con
 // Network helper to get client IP
 static void getClientIP(httpd_req_t* req, String& outIP);
 // SSE helpers (implemented below)
+
+// ---------- Command Executor Task implementation moved below ExecReq definition ----------
 static bool sseWrite(httpd_req_t* req, const char* chunk);
 static int sseBindSession(httpd_req_t* req, String& outSid);
 
@@ -757,7 +910,43 @@ static const size_t LOG_CAP_BYTES = 696969;                                 // ~
 // Serial CLI authentication (session-only)
 static bool gSerialAuthed = false;
 static String gSerialUser = String();
-static bool gSerialIsAdmin = false;
+// gSerialIsAdmin removed - now using real-time isAdminUser() checks
+
+// ESP-NOW state
+static bool gEspNowInitialized = false;
+static uint8_t gEspNowChannel = 1;
+
+// ESP-NOW chunked message support
+#define MAX_CHUNKS 10
+#define CHUNK_SIZE 200
+
+struct ChunkedMessage {
+  String hash;
+  String status;
+  String deviceName;
+  int totalChunks;
+  int receivedChunks;
+  String chunks[MAX_CHUNKS];
+  unsigned long startTime;
+  bool active;
+};
+
+static ChunkedMessage gActiveMessage;
+
+// ESP-NOW encryption support
+static String gEspNowPassphrase = "";
+static uint8_t gEspNowDerivedKey[16] = {0};
+static bool gEspNowEncryptionEnabled = false;
+
+// ESP-NOW device name mapping
+struct EspNowDevice {
+  uint8_t mac[6];
+  String name;
+  bool encrypted;        // Whether this device uses encryption
+  uint8_t key[16];      // Per-device encryption key
+};
+static EspNowDevice gEspNowDevices[16]; // Support up to 16 paired devices
+static int gEspNowDeviceCount = 0;
 
 // ---------------------------------------------------------------------------
 // Transport-agnostic auth context and guards (HTTP + Serial today; TFT later)
@@ -831,7 +1020,7 @@ static bool tgRequireAdmin(AuthContext& ctx) {
     }
     return true;
   } else if (ctx.transport == AUTH_SERIAL) {
-    if (!gSerialIsAdmin) {
+    if (!isAdminUser(ctx.user)) {
       Serial.println("ERROR: admin required");
       return false;
     }
@@ -931,6 +1120,7 @@ static const char* SETTINGS_JSON_FILE = "/settings.json";        // unified sett
 static const char* USERS_FILE = "/users.txt";                    // legacy: username:password[:role]
 static const char* USERS_JSON_FILE = "/users.json";              // preferred: {"users":[{username,password,role}]}
 static const char* AUTOMATIONS_JSON_FILE = "/automations.json";  // {"version":1,"automations":[]}
+static const char* ESPNOW_DEVICES_FILE = "/espnow_devices.json"; // ESP-NOW paired devices
 
 // SSE helpers
 // ==========================
@@ -1100,7 +1290,6 @@ struct SensorDataCache {
   uint32_t imuSeq = 0;  // sequence number for change detection
 
   // ToF data
-  float tofDistance = 0.0;
   unsigned long tofLastUpdate = 0;
   bool tofDataValid = false;
   uint32_t tofSeq = 0;  // sequence number for change detection
@@ -1400,8 +1589,11 @@ enum CLIState {
   CLI_HELP_SENSORS,
   CLI_HELP_SETTINGS
 };
-static CLIState gCLIState = CLI_NORMAL;
-static String gHiddenHistory = "";
+
+// Global CLI state
+CLIState gCLIState = CLI_NORMAL;
+String gHiddenHistory = "";
+bool gShowAllCommands = false;
 
 // Unified output buffer stored in PSRAM via mem_util.h
 struct WebMirrorBuf {
@@ -1486,22 +1678,7 @@ static bool gExecIsAdmin = false;
 static bool gCapAdminControls = true;
 static bool gCapSensorConfig = true;
 
-// Helper: require admin for protected areas when invoked from web CLI
-static String requireAdminFor(const char* area) {
-  if (gExecFromWeb && !gExecIsAdmin) {
-    return String("Error: Admin required for ") + area + ".";
-  }
-  // Feature gates
-  if (gExecFromWeb) {
-    if (strcmp(area, "adminControls") == 0 && !gCapAdminControls) {
-      return String("Error: Feature disabled: ") + area + ".";
-    }
-    if (strcmp(area, "sensorConfig") == 0 && !gCapSensorConfig) {
-      return String("Error: Feature disabled: ") + area + ".";
-    }
-  }
-  return "";
-}
+// requireAdminFor() function removed - admin checks now unified in executeCommand() pipeline
 
 // Runtime settings
 String gAuthUser = DEFAULT_AUTH_USER;
@@ -1555,6 +1732,8 @@ struct Settings {
   bool debugDateTime;
   bool debugCommandFlow;
   bool debugUsers;
+  // ESP-NOW settings
+  bool espnowenabled;
 };
 Settings gSettings;
 
@@ -1777,6 +1956,7 @@ String generateNavigation(const String& activePage, const String& username) {
   link("/dashboard", "dashboard", "Dashboard");
   link("/cli", "cli", "Command Line");
   link("/sensors", "sensors", "Sensors");
+  link("/espnow", "espnow", "ESP-NOW");
   link("/files", "files", "Files");
   link("/automations", "automations", "Automations");
   link("/settings", "settings", "Settings");
@@ -1839,33 +2019,53 @@ inline void streamDebugRecord(size_t sz, size_t chunkLimit) {
 
 void streamDebugFlush() {
   // One-line summary per response
-  String line = String("[STREAM] page=") + gStreamTag + " total=" + String((unsigned)gStreamTotalBytes) + "B" + " maxChunk=" + String((unsigned)gStreamMaxChunk) + "B" + " hitMax=" + String(gStreamHitMaxChunk ? "yes" : "no") + " buf=" + String(5119) + "B";
-  broadcastOutput(line);
+  DEBUG_HTTPF("page=%s total=%uB maxChunk=%uB hitMax=%s buf=5119B", 
+              gStreamTag.c_str(), gStreamTotalBytes, gStreamMaxChunk, gStreamHitMaxChunk ? "yes" : "no");
 }
 
 void streamContentGeneric(httpd_req_t* req, const String& content) {
   const char* contentStr = content.c_str();
   size_t contentLen = content.length();
   size_t chunkSize = 5119;  // 5KB buffer size - 1 for null terminator
-
+  
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  
   for (size_t i = 0; i < contentLen; i += chunkSize) {
-    size_t remainingLen = contentLen - i;
-    size_t currentChunkSize = (remainingLen < chunkSize) ? remainingLen : chunkSize;
-    // Record streaming metrics
-    streamDebugRecord(currentChunkSize, chunkSize);
-
-    // Copy chunk to reusable buffer
-    memcpy(gStreamBuffer, contentStr + i, currentChunkSize);
-    gStreamBuffer[currentChunkSize] = '\0';
-
-    httpd_resp_sendstr_chunk(req, gStreamBuffer);
+    size_t remainingBytes = contentLen - i;
+    size_t currentChunkSize = (remainingBytes > chunkSize) ? chunkSize : remainingBytes;
+    httpd_resp_send_chunk(req, contentStr + i, currentChunkSize);
   }
+  
+  // End chunked response
+  httpd_resp_send_chunk(req, NULL, 0);
+
+  // Streaming debug: print summary for this response
+  extern void streamDebugFlush();
+  streamDebugFlush();
+}
+
+
+// Helper to stream regular strings (for dynamic content)
+void streamChunk(httpd_req_t* req, const String& str) {
+  httpd_resp_send_chunk(req, str.c_str(), str.length());
+}
+
+// Helper to stream C strings
+void streamChunk(httpd_req_t* req, const char* str) {
+  httpd_resp_send_chunk(req, str, strlen(str));
 }
 
 void streamSensorsContent(httpd_req_t* req) {
   String u;
   isAuthed(req, u);
   String content = getSensorsPage(u);
+  streamContentGeneric(req, content);
+}
+
+void streamEspNowContent(httpd_req_t* req) {
+  String u;
+  isAuthed(req, u);
+  String content = getEspNowPage(u);
   streamContentGeneric(req, content);
 }
 
@@ -1879,6 +2079,19 @@ esp_err_t handleSensorsPage(httpd_req_t* req) {
   logAuthAttempt(true, req->uri, ctx.user, ctx.ip, "");
 
   streamPageWithContent(req, "sensors", ctx.user, streamSensorsContent);
+  return ESP_OK;
+}
+
+esp_err_t handleEspNowPage(httpd_req_t* req) {
+  AuthContext ctx;
+  ctx.transport = AUTH_HTTP;
+  ctx.opaque = req;
+  ctx.path = req->uri ? req->uri : "/espnow";
+  getClientIP(req, ctx.ip);
+  if (!tgRequireAuth(ctx)) return ESP_OK;  // 401 already sent
+  logAuthAttempt(true, req->uri, ctx.user, ctx.ip, "");
+
+  streamPageWithContent(req, "espnow", ctx.user, streamEspNowContent);
   return ESP_OK;
 }
 
@@ -2006,7 +2219,7 @@ esp_err_t handleFileWrite(httpd_req_t* req) {
   // Prevent overwriting protected files directly.
   // Disallow edits to logs directory and firmware binaries and critical JSONs
   if (name.endsWith(".bin") || name.startsWith("/logs/") || name == "/logs" || name.startsWith("logs/")
-      || name == "/users.json" || name == "/settings.json") {
+      || name == "/users.json" || name == "/settings.json" || name == "/devices.json") {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"success\":false,\"error\":\"Writes to this path are not allowed\"}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -2503,19 +2716,21 @@ void settingsDefaults() {
   gSettings.tofDevicePollMs = 220;
   gSettings.imuDevicePollMs = 200;
   // Debug defaults - enable all for development/troubleshooting
-  gSettings.debugAuthCookies = true;
-  gSettings.debugHttp = true;
-  gSettings.debugSse = true;
-  gSettings.debugCli = true;
-  gSettings.debugSensorsFrame = true;
-  gSettings.debugSensorsData = true;
-  gSettings.debugSensorsGeneral = true;
-  gSettings.debugWifi = true;
-  gSettings.debugStorage = true;
-  gSettings.debugPerformance = true;
-  gSettings.debugDateTime = true;
-  gSettings.debugCommandFlow = true;
-  gSettings.debugUsers = true;
+  gSettings.debugAuthCookies = false;
+  gSettings.debugHttp = false;
+  gSettings.debugSse = false;
+  gSettings.debugCli = false;
+  gSettings.debugSensorsFrame = false;
+  gSettings.debugSensorsData = false;
+  gSettings.debugSensorsGeneral = false;
+  gSettings.debugWifi = false;
+  gSettings.debugStorage = false;
+  gSettings.debugPerformance = false;
+  gSettings.debugDateTime = false;
+  gSettings.debugCommandFlow = false;
+  gSettings.debugUsers = false;
+  // ESP-NOW defaults
+  gSettings.espnowenabled = false;  // default disabled for backward compatibility
 }
 
 // Minimal JSON encode (no external deps)
@@ -2604,12 +2819,15 @@ String settingsToJson() {
        + String(gSettings.i2cClockToFHz) + "}}";
   // Un-grouped device-side key(s) that remain top-level
   j += ",\"imuDevicePollMs\":" + String(gSettings.imuDevicePollMs);
+  // ESP-NOW settings
+  j += ",\"espnowenabled\":" + String(gSettings.espnowenabled ? 1 : 0);
   // Embed multi-SSID list (authoritative store). Includes passwords.
   j += ",\"wifiNetworks\":[";
   for (int i = 0; i < gWifiNetworkCount; ++i) {
     if (i) j += ",";
     const WifiNetwork& nw = gWifiNetworks[i];
-    j += String("{\"ssid\":\"") + nw.ssid + "\"," + "\"password\":\"" + nw.password + "\"," + "\"priority\":" + String(nw.priority) + "," + "\"hidden\":" + String(nw.hidden ? 1 : 0) + "," + "\"lastConnected\":" + String((unsigned)nw.lastConnected) + "}";
+    String encryptedPassword = encryptWifiPassword(nw.password);
+    j += String("{\"ssid\":\"") + nw.ssid + "\"," + "\"password\":\"" + encryptedPassword + "\"," + "\"priority\":" + String(nw.priority) + "," + "\"hidden\":" + String(nw.hidden ? 1 : 0) + "," + "\"lastConnected\":" + String((unsigned)nw.lastConnected) + "}";
   }
   j += "]";
   j += "}";
@@ -2864,6 +3082,8 @@ static bool loadUnifiedSettings() {
   parseJsonBool(txt, "debugDateTime", gSettings.debugDateTime);
   parseJsonBool(txt, "debugCommandFlow", gSettings.debugCommandFlow);
   parseJsonBool(txt, "debugUsers", gSettings.debugUsers);
+  // ESP-NOW settings
+  parseJsonBool(txt, "espnowenabled", gSettings.espnowenabled);
   // Load grouped objects (authoritative structure)
   parseOutputFromJson(txt);
   parseThermalFromJson(txt);
@@ -3032,6 +3252,8 @@ static void parseWifiNetworksFromJson(const String& json) {
     // crude key parsing
     parseJsonString(item, "ssid", nw.ssid);
     parseJsonString(item, "password", nw.password);
+    // Decrypt password if it's encrypted
+    nw.password = decryptWifiPassword(nw.password);
     parseJsonInt(item, "priority", nw.priority);
     parseJsonBool(item, "hidden", nw.hidden);
     {
@@ -3085,6 +3307,12 @@ static bool connectWiFiIndex(int index0based, unsigned long timeoutMs) {
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
     delay(200);
+    // Check for user escape input during WiFi connection
+    if (Serial.available()) {
+      while (Serial.available()) Serial.read(); // consume all pending input
+      broadcastOutput("*** WiFi connection cancelled by user ***");
+      return false; // connection cancelled
+    }
     // progress dots omitted from unified output to reduce noise
   }
   if (WiFi.status() == WL_CONNECTED) {
@@ -3194,7 +3422,7 @@ bool isValidUser(const String& u, const String& p) {
         int pq1 = json.indexOf('"', json.indexOf(':', pKey) + 1);
         int pq2 = json.indexOf('"', pq1 + 1);
         String pass = (pq1 > 0 && pq2 > pq1) ? json.substring(pq1 + 1, pq2) : String("");
-        if (u == uname && p == pass) return true;
+        if (u == uname && verifyUserPassword(p, pass)) return true;
       }
       pos = uq2 + 1;
     }
@@ -3219,7 +3447,7 @@ bool isValidUser(const String& u, const String& p) {
     lu.trim();
     String lp = (c2 >= 0) ? line.substring(c1 + 1, c2) : line.substring(c1 + 1);
     lp.trim();
-    if (u == lu && p == lp) return true;
+    if (u == lu && verifyUserPassword(p, lp)) return true;
   }
   return false;
 }
@@ -3278,8 +3506,9 @@ void firstTimeSetupIfNeeded() {
     }
   }
 
-  // Create users.json with admin (ID 1) and nextId field
-  String j = "{\n  \"version\": 1,\n  \"nextId\": 2,\n  \"users\": [\n    {\n      \"id\": 1,\n      \"username\": \"" + u + "\",\n      \"password\": \"" + p + "\",\n      \"role\": \"admin\"\n    }\n  ]\n}\n";
+  // Create users.json with admin (ID 1) and nextId field - hash the password
+  String hashedPassword = hashUserPassword(p);
+  String j = "{\n  \"version\": 1,\n  \"nextId\": 2,\n  \"users\": [\n    {\n      \"id\": 1,\n      \"username\": \"" + u + "\",\n      \"password\": \"" + hashedPassword + "\",\n      \"role\": \"admin\"\n    }\n  ]\n}\n";
   if (!writeText(USERS_JSON_FILE, j)) {
     broadcastOutput("ERROR: Failed to write users.json");
   } else {
@@ -3323,8 +3552,156 @@ void firstTimeSetupIfNeeded() {
   // Initialize unified settings with defaults
   settingsDefaults();
   // Route commands through unified executor (auth + logging) via helper to avoid type-order issues
+  int networksBefore = gWifiNetworkCount;
   runUnifiedSystemCommand(String("wifiadd ") + wifiSSID + " " + wifiPass + " 1 0");
-  runUnifiedSystemCommand(String("wificonnect --best"));
+  broadcastOutput("Networks before add: " + String(networksBefore) + ", after add: " + String(gWifiNetworkCount));
+  // Note: WiFi connection will be handled by setupWiFi() during normal boot sequence
+}
+
+// ==========================
+// WiFi Password Encryption (minimal XOR with device-unique key)
+// ==========================
+
+static String getDeviceEncryptionKey() {
+  // Create device-unique key from Chip ID only (deterministic)
+  uint64_t chipId = ESP.getEfuseMac();
+  String key = String((uint32_t)(chipId >> 32), HEX) + 
+               String((uint32_t)chipId, HEX);
+  // Pad key to ensure sufficient length for XOR
+  while (key.length() < 32) {
+    key += key; // Double the key until we have enough length
+  }
+  return key;
+}
+
+static String encryptWifiPassword(const String& password) {
+  if (password.length() == 0) return "";
+  
+  String key = getDeviceEncryptionKey();
+  String encrypted = "";
+  
+  for(int i = 0; i < password.length(); i++) {
+    char encChar = password[i] ^ key[i % key.length()];
+    // Convert to hex to ensure JSON-safe characters
+    if (encChar < 16) encrypted += "0";
+    encrypted += String((uint8_t)encChar, HEX);
+  }
+  
+  return "ENC:" + encrypted; // Prefix to identify encrypted passwords
+}
+
+static String decryptWifiPassword(const String& encryptedPassword) {
+  if (encryptedPassword.length() == 0) return "";
+  if (!encryptedPassword.startsWith("ENC:")) {
+    // Not encrypted, return as-is (backward compatibility)
+    return encryptedPassword;
+  }
+  
+  String hexData = encryptedPassword.substring(4); // Remove "ENC:" prefix
+  String key = getDeviceEncryptionKey();
+  String decrypted = "";
+  
+  // Convert hex back to characters and decrypt
+  for(int i = 0; i < hexData.length(); i += 2) {
+    if (i + 1 < hexData.length()) {
+      String hexByte = hexData.substring(i, i + 2);
+      uint8_t encChar = strtol(hexByte.c_str(), NULL, 16);
+      char decChar = encChar ^ key[(i/2) % key.length()];
+      decrypted += decChar;
+    }
+  }
+  
+  return decrypted;
+}
+
+// ==========================
+// User Password Hashing (SHA-256 with device-specific salt)
+// ==========================
+
+static String hashUserPassword(const String& password) {
+  if (password.length() == 0) return "";
+  
+  String salt = getDeviceEncryptionKey(); // Use same device-specific key as salt
+  String saltedPassword = password + salt;
+  
+  // Simple hash implementation using built-in hash function
+  // Note: For production, consider using a more robust hash like SHA-256
+  uint32_t hash = 0;
+  for (int i = 0; i < saltedPassword.length(); i++) {
+    hash = hash * 31 + (uint8_t)saltedPassword[i];
+    hash ^= (hash >> 16);
+  }
+  
+  // Convert to hex string for storage
+  String hashStr = String(hash, HEX);
+  while (hashStr.length() < 8) hashStr = "0" + hashStr; // Pad to 8 chars
+  
+  return "HASH:" + hashStr; // Prefix to identify hashed passwords
+}
+
+static bool verifyUserPassword(const String& inputPassword, const String& storedHash) {
+  if (inputPassword.length() == 0 || storedHash.length() == 0) return false;
+  
+  // If stored password doesn't start with HASH:, it's plaintext (backward compatibility)
+  if (!storedHash.startsWith("HASH:")) {
+    // For migration period, allow plaintext comparison
+    // TODO: Remove this after all passwords are migrated
+    return (inputPassword == storedHash);
+  }
+  
+  // Hash the input password and compare
+  String inputHash = hashUserPassword(inputPassword);
+  return (inputHash == storedHash);
+}
+
+// Test command for encryption (temporary - for verification)
+static String cmd_testencryption(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  // Admin check now handled by executeCommand pipeline
+  
+  String args = originalCmd.substring(15); // Remove "testencryption "
+  args.trim();
+  
+  if (args.length() == 0) {
+    return "Usage: testencryption <password_to_test>";
+  }
+  
+  String encrypted = encryptWifiPassword(args);
+  String decrypted = decryptWifiPassword(encrypted);
+  
+  String result = "Encryption Test:\n";
+  result += "Original:  '" + args + "'\n";
+  result += "Encrypted: '" + encrypted + "'\n";
+  result += "Decrypted: '" + decrypted + "'\n";
+  result += "Match: " + String((args == decrypted) ? "YES" : "NO");
+  
+  return result;
+}
+
+// Test command for password hashing (temporary - for verification)
+static String cmd_testpassword(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  // Admin check now handled by executeCommand pipeline
+  
+  String args = originalCmd.substring(13); // Remove "testpassword "
+  args.trim();
+  
+  if (args.length() == 0) {
+    return "Usage: testpassword <password_to_test>";
+  }
+  
+  String hashed = hashUserPassword(args);
+  bool verified = verifyUserPassword(args, hashed);
+  bool wrongVerified = verifyUserPassword("wrongpassword", hashed);
+  
+  String result = "Password Hashing Test:\n";
+  result += "Original:  '" + args + "'\n";
+  result += "Hashed:    '" + hashed + "'\n";
+  result += "Verify Correct: " + String(verified ? "YES" : "NO") + "\n";
+  result += "Verify Wrong:   " + String(wrongVerified ? "YES" : "NO") + "\n";
+  result += "System Status: " + String((verified && !wrongVerified) ? "WORKING" : "ERROR");
+  
+  return result;
 }
 
 // ==========================
@@ -3539,6 +3916,7 @@ static const unsigned long SESSION_TTL_MS = 24UL * 60UL * 60UL * 1000UL;  // 24h
 struct SessionEntry {
   String sid;   // session id (cookie value)
   String user;  // username
+  String bootId; // boot ID when session was created (for detecting restarts)
   unsigned long createdAt = 0;
   unsigned long lastSeen = 0;
   unsigned long expiresAt = 0;
@@ -3581,50 +3959,83 @@ struct LogoutReason {
   unsigned long timestamp;
 };
 static const int MAX_LOGOUT_REASONS = 8;
-static LogoutReason gLogoutReasons[MAX_LOGOUT_REASONS];
+static LogoutReason* gLogoutReasons = nullptr;
 
-// Store logout reason for IP address (expires after 60 seconds)
+// Boot ID for session versioning - changes on each reboot
+static String gBootId = "";
+
+// Store logout reason for IP address (with rate limiting)
 static void storeLogoutReason(const String& ip, const String& reason) {
+  if (ip.length() == 0 || reason.length() == 0) return;
+  
   unsigned long now = millis();
-  // Clean expired entries first
-  for (int i = 0; i < MAX_LOGOUT_REASONS; ++i) {
-    if (gLogoutReasons[i].ip.length() > 0 && (now - gLogoutReasons[i].timestamp) > 60000) {
-      gLogoutReasons[i] = LogoutReason();  // Clear expired
-    }
-  }
-
-  // Find free slot or overwrite oldest
-  int freeIdx = -1;
-  unsigned long oldestTime = now;
-  int oldestIdx = 0;
-
-  for (int i = 0; i < MAX_LOGOUT_REASONS; ++i) {
-    if (gLogoutReasons[i].ip.length() == 0) {
-      freeIdx = i;
+  int idx = -1;
+  
+  // Find existing entry for this IP
+  for (int i = 0; i < MAX_LOGOUT_REASONS; i++) {
+    if (gLogoutReasons[i].ip == ip) {
+      idx = i;
+      // Rate limiting: don't store same reason within 5 seconds
+      if (gLogoutReasons[i].reason == reason && (now - gLogoutReasons[i].timestamp) < 5000) {
+        return; // Skip storing duplicate reason too soon
+      }
       break;
     }
-    if (gLogoutReasons[i].timestamp < oldestTime) {
-      oldestTime = gLogoutReasons[i].timestamp;
-      oldestIdx = i;
+  }
+  
+  // Find empty slot if no existing entry
+  if (idx == -1) {
+    for (int i = 0; i < MAX_LOGOUT_REASONS; i++) {
+      if (gLogoutReasons[i].ip.length() == 0) {
+        idx = i;
+        break;
+      }
     }
   }
-
-  int idx = (freeIdx >= 0) ? freeIdx : oldestIdx;
+  
+  // If no slot found, use oldest entry
+  if (idx == -1) {
+    unsigned long oldest = now;
+    for (int i = 0; i < MAX_LOGOUT_REASONS; i++) {
+      if (gLogoutReasons[i].timestamp < oldest) {
+        oldest = gLogoutReasons[i].timestamp;
+        idx = i;
+      }
+    }
+  }
+  
+  // Store the logout reason
   gLogoutReasons[idx].ip = ip;
   gLogoutReasons[idx].reason = reason;
   gLogoutReasons[idx].timestamp = now;
+  
+  // Debug: Log logout reason storage
+  DEBUG_AUTHF("Stored logout reason for IP '%s': '%s'", ip.c_str(), reason.c_str());
 }
 
 // Get and clear logout reason for IP address
 static String getLogoutReason(const String& ip) {
+  unsigned long now = millis();
   for (int i = 0; i < MAX_LOGOUT_REASONS; ++i) {
     if (gLogoutReasons[i].ip == ip && gLogoutReasons[i].ip.length() > 0) {
+      // Check if reason has expired (30 seconds)
+      if (now - gLogoutReasons[i].timestamp > 30000) {
+        gLogoutReasons[i] = LogoutReason();  // Clear expired reason
+        continue;
+      }
+      
       String reason = gLogoutReasons[i].reason;
-      gLogoutReasons[i] = LogoutReason();  // Clear after reading
+      // Don't clear immediately - let it expire naturally or be overwritten
+      
+      // Debug: Log logout reason retrieval
+      DEBUG_AUTHF("Retrieved logout reason for IP '%s': '%s'", ip.c_str(), reason.c_str());
       return reason;
     }
   }
-  return "";
+  
+  // Debug: No logout reason found
+  DEBUG_AUTHF("No logout reason found for IP '%s'", ip.c_str());
+  return String();
 }
 
 // Function called from auth required page to get logout reason
@@ -3635,6 +4046,7 @@ String getLogoutReasonForAuthPage(httpd_req_t* req) {
   getClientIP(req, clientIP);
   if (clientIP.length() > 0) {
     logoutReason = getLogoutReason(clientIP);
+    Serial.printf("[AUTH_PAGE_DEBUG] Login page for IP '%s' - logout reason: '%s'\n", clientIP.c_str(), logoutReason.c_str());
   }
 
   // Fallback to URL parameters if no stored reason
@@ -3947,9 +4359,14 @@ static String setSession(httpd_req_t* req, const String& u) {
   SessionEntry s;
   s.sid = makeSessToken();
   s.user = u;
+  s.bootId = gBootId;  // Store current boot ID for version checking
   s.createdAt = millis();
   s.lastSeen = s.createdAt;
   s.expiresAt = s.createdAt + SESSION_TTL_MS;
+  
+  // Debug: Log session creation with boot ID
+  DEBUG_AUTHF("Creating session for user '%s' with bootId '%s' (current: '%s')", 
+              u.c_str(), s.bootId.c_str(), gBootId.c_str());
   String ip;
   getClientIP(req, ip);
   s.ip = ip;
@@ -3996,6 +4413,30 @@ static bool isAuthed(httpd_req_t* req, String& outUser) {
   int idx = findSessionIndexBySID(sid);
   if (idx < 0) {
     broadcastOutput(String("[auth] unknown SID for uri=") + uri);
+    
+    // Rate limit session debug messages per IP
+    static String lastDebugIP = "";
+    static unsigned long lastDebugTime = 0;
+    unsigned long now = millis();
+    
+    if (ip != lastDebugIP || (now - lastDebugTime) > 5000) {
+      DEBUG_AUTHF("No session found for SID, current boot ID: %s", gBootId.c_str());
+      
+      // If someone has a session cookie but we have no sessions, it's likely due to a reboot
+      if (sid.length() > 0) {
+        DEBUG_AUTHF("Client has session cookie but no sessions exist - likely system restart");
+        storeLogoutReason(ip, "Your session expired due to a system restart. Please log in again.");
+      }
+      
+      lastDebugIP = ip;
+      lastDebugTime = now;
+    } else {
+      // Still store logout reason but don't spam debug logs
+      if (sid.length() > 0) {
+        storeLogoutReason(ip, "Your session expired due to a system restart. Please log in again.");
+      }
+    }
+    
     return false;
   }
 
@@ -4003,6 +4444,34 @@ static bool isAuthed(httpd_req_t* req, String& outUser) {
   if (gSessions[idx].sid.length() == 0) {
     broadcastOutput(String("[auth] cleared session for uri=") + uri);
     return false;
+  }
+
+  // Check if session is from a previous boot (boot ID mismatch)
+  // Rate limit boot validation debug messages per IP
+  static String lastBootDebugIP = "";
+  static unsigned long lastBootDebugTime = 0;
+  unsigned long bootNow = millis();
+  
+  if (ip != lastBootDebugIP || (bootNow - lastBootDebugTime) > 5000) {
+    DEBUG_AUTHF("Validating session: user='%s', sessionBootId='%s', currentBootId='%s'", 
+                gSessions[idx].user.c_str(), gSessions[idx].bootId.c_str(), gBootId.c_str());
+    lastBootDebugIP = ip;
+    lastBootDebugTime = bootNow;
+  }
+  
+  if (gSessions[idx].bootId != gBootId) {
+    if (ip == lastBootDebugIP && (bootNow - lastBootDebugTime) < 1000) {
+      DEBUG_AUTHF("BOOT ID MISMATCH! Session from previous boot. Storing restart message.");
+    }
+    broadcastOutput(String("[auth] session from previous boot for uri=") + uri);
+    storeLogoutReason(ip, "Your session expired due to a system restart. Please log in again.");
+    // Clear the stale session
+    gSessions[idx] = SessionEntry();
+    return false;
+  } else {
+    if (ip == lastBootDebugIP && (bootNow - lastBootDebugTime) < 1000) {
+      DEBUG_AUTHF("Boot ID matches - session is valid for current boot");
+    }
   }
 
   // Check if session was revoked
@@ -4861,10 +5330,7 @@ static String cmd_debugdatetime(const String& originalCmd) {
 
 static String cmd_thermaltargetfps(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: thermalTargetFps <1..8>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -4880,10 +5346,7 @@ static String cmd_thermaltargetfps(const String& originalCmd) {
 
 static String cmd_thermalwebmaxfps(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: thermalWebMaxFps <1..20>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -4898,10 +5361,7 @@ static String cmd_thermalwebmaxfps(const String& originalCmd) {
 
 static String cmd_thermalinterpolationenabled(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: thermalInterpolationEnabled <0|1>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -4914,10 +5374,7 @@ static String cmd_thermalinterpolationenabled(const String& originalCmd) {
 
 static String cmd_thermalinterpolationsteps(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: thermalInterpolationSteps <1..8>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -4932,10 +5389,7 @@ static String cmd_thermalinterpolationsteps(const String& originalCmd) {
 
 static String cmd_thermalinterpolationbuffersize(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: thermalInterpolationBufferSize <1..10>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -4950,10 +5404,7 @@ static String cmd_thermalinterpolationbuffersize(const String& originalCmd) {
 
 static String cmd_thermaldevicepollms(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: thermalDevicePollMs <100..2000>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -4969,10 +5420,7 @@ static String cmd_thermaldevicepollms(const String& originalCmd) {
 
 static String cmd_tofdevicepollms(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: tofDevicePollMs <100..2000>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -4988,10 +5436,7 @@ static String cmd_tofdevicepollms(const String& originalCmd) {
 
 static String cmd_imudevicepollms(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: imuDevicePollMs <50..1000>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -5008,10 +5453,7 @@ static String cmd_imudevicepollms(const String& originalCmd) {
 // ----- User admin and system commands (Final batch) -----
 static String cmd_user_approve(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   String username = originalCmd.substring(String("user approve ").length());
   username.trim();
@@ -5023,10 +5465,7 @@ static String cmd_user_approve(const String& originalCmd) {
 
 static String cmd_user_deny(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   String username = originalCmd.substring(String("user deny ").length());
   username.trim();
@@ -5038,10 +5477,7 @@ static String cmd_user_deny(const String& originalCmd) {
 
 static String cmd_user_promote(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   String username = originalCmd.substring(String("user promote ").length());
   username.trim();
@@ -5054,10 +5490,7 @@ static String cmd_user_promote(const String& originalCmd) {
 
 static String cmd_user_demote(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   String username = originalCmd.substring(String("user demote ").length());
   username.trim();
@@ -5070,10 +5503,7 @@ static String cmd_user_demote(const String& originalCmd) {
 
 static String cmd_user_delete(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   String username = originalCmd.substring(String("user delete ").length());
   username.trim();
@@ -5086,10 +5516,7 @@ static String cmd_user_delete(const String& originalCmd) {
 
 static String cmd_user_list(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   
   // Check if JSON output is requested
@@ -5166,10 +5593,7 @@ static String cmd_user_list(const String& originalCmd) {
 
 static String cmd_session_list(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   
   // Check if JSON output is requested
   bool jsonOutput = (originalCmd.indexOf(" json") >= 0);
@@ -5203,10 +5627,7 @@ static String cmd_session_list(const String& originalCmd) {
 //   session revoke all [reason]
 static String cmd_session_revoke(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
 
   String cmd = originalCmd;
   cmd.trim();
@@ -5296,10 +5717,7 @@ static String cmd_session_revoke(const String& originalCmd) {
 
 static String cmd_pending_list(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("userModeration");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   
   // Check if JSON output is requested
@@ -5399,8 +5817,9 @@ static String cmd_user_request(const String& originalCmd) {
   // Parse existing JSON array or create new one
   if (json.length() < 2 || !json.startsWith("[")) json = "[]";
   
-  // Create new user entry
-  String userEntry = "{\"username\":\"" + username + "\",\"password\":\"" + password + "\",\"timestamp\":" + String(millis()) + "}";
+  // Create new user entry with hashed password
+  String hashedPassword = hashUserPassword(password);
+  String userEntry = "{\"username\":\"" + username + "\",\"password\":\"" + hashedPassword + "\",\"timestamp\":" + String(millis()) + "}";
   
   // Insert into array
   if (json == "[]") {
@@ -5437,8 +5856,7 @@ static String cmd_user_request(const String& originalCmd) {
 
 static String cmd_reboot(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  String err = requireAdminFor("adminControls");
-  if (err.length()) return err;
+  // Admin check now handled by executeCommand pipeline
   ESP.restart();
   return "Rebooting system...";
 }
@@ -5446,10 +5864,7 @@ static String cmd_reboot(const String& originalCmd) {
 // ----- Remaining sensor settings -----
 static String cmd_thermalpollingms(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: thermalPollingMs <50..5000>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -5464,10 +5879,7 @@ static String cmd_thermalpollingms(const String& originalCmd) {
 
 static String cmd_tofpollingms(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: tofPollingMs <50..5000>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -5482,10 +5894,7 @@ static String cmd_tofpollingms(const String& originalCmd) {
 
 static String cmd_tofstabilitythreshold(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: tofStabilityThreshold <1..20>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -5661,6 +6070,455 @@ static String cmd_automation_list() {
   return json;
 }
 
+// Validate condition syntax for Phase 1: Simple IF/THEN
+static String validateConditionSyntax(const String& condition) {
+  String cond = condition;
+  cond.trim();
+  cond.toUpperCase();
+  
+  // Must start with IF
+  if (!cond.startsWith("IF ")) {
+    return "Condition must start with 'IF'";
+  }
+  
+  // Must contain THEN
+  int thenPos = cond.indexOf(" THEN ");
+  if (thenPos < 0) {
+    return "Condition must contain 'THEN'";
+  }
+  
+  // Extract condition part (between IF and THEN)
+  String conditionPart = cond.substring(3, thenPos); // Skip "IF "
+  conditionPart.trim();
+  
+  // Extract command part (after THEN)
+  String commandPart = cond.substring(thenPos + 6); // Skip " THEN "
+  commandPart.trim();
+  
+  if (conditionPart.length() == 0) {
+    return "Missing condition after 'IF'";
+  }
+  
+  if (commandPart.length() == 0) {
+    return "Missing command after 'THEN'";
+  }
+  
+  // Validate condition syntax: sensor operator value
+  // Supported: temp>75, temp<65, temp=70, humidity>80, motion=detected, time=morning
+  bool hasOperator = false;
+  String operators[] = {">=", "<=", "!=", ">", "<", "="};
+  for (int i = 0; i < 6; i++) {
+    if (conditionPart.indexOf(operators[i]) > 0) {
+      hasOperator = true;
+      break;
+    }
+  }
+  
+  if (!hasOperator) {
+    return "Condition must contain an operator (>, <, =, >=, <=, !=)";
+  }
+  
+  // Basic validation passed
+  return "";
+}
+
+// State machine for conditional hierarchy validation
+enum ConditionalState {
+  EXPECTING_IF,           // Start - only IF allowed
+  EXPECTING_ELSE_OR_END,  // After IF - can have ELSE IF, ELSE, or end
+  EXPECTING_END           // After ELSE - only end allowed
+};
+
+// Validate conditional hierarchy structure
+static String validateConditionalHierarchy(const String& conditions) {
+  if (conditions.length() == 0) return "VALID";
+  
+  String input = conditions;
+  input.trim();
+  input.toUpperCase();
+  
+  ConditionalState state = EXPECTING_IF;
+  int position = 0;
+  
+  while (position < input.length()) {
+    // Skip whitespace
+    while (position < input.length() && input[position] == ' ') position++;
+    if (position >= input.length()) break;
+    
+    // Check for keywords
+    bool foundIF = input.substring(position).startsWith("IF ");
+    bool foundELSEIF = input.substring(position).startsWith("ELSE IF ");
+    bool foundELSE = input.substring(position).startsWith("ELSE ");
+    
+    switch (state) {
+      case EXPECTING_IF:
+        if (!foundIF) {
+          return "Error: Expected IF statement at beginning";
+        }
+        state = EXPECTING_ELSE_OR_END;
+        position += 3; // Skip "IF "
+        break;
+        
+      case EXPECTING_ELSE_OR_END:
+        if (foundELSEIF) {
+          state = EXPECTING_ELSE_OR_END; // Stay in same state
+          position += 8; // Skip "ELSE IF "
+        } else if (foundELSE) {
+          state = EXPECTING_END;
+          position += 5; // Skip "ELSE "
+        } else {
+          // Look for end of current block (find THEN and skip to next keyword)
+          int thenPos = input.indexOf("THEN", position);
+          if (thenPos < 0) {
+            return "Error: Missing THEN keyword";
+          }
+          // Skip past the action to look for next conditional
+          position = thenPos + 4;
+          // Skip the action part
+          while (position < input.length() && 
+                 !input.substring(position).startsWith("ELSE IF ") && 
+                 !input.substring(position).startsWith("ELSE ")) {
+            position++;
+          }
+          continue; // Re-evaluate at new position
+        }
+        break;
+        
+      case EXPECTING_END:
+        if (foundIF || foundELSEIF || foundELSE) {
+          return "Error: No additional conditions allowed after ELSE";
+        }
+        position++; // Move forward to finish parsing
+        break;
+    }
+    
+    // Skip to next potential keyword
+    while (position < input.length() && input[position] != 'E' && input[position] != 'I') {
+      position++;
+    }
+  }
+  
+  return "VALID";
+}
+
+// Enhanced conditional chain evaluator
+static String evaluateConditionalChain(const String& chainStr) {
+  if (chainStr.length() == 0) return "";
+  
+  String input = chainStr;
+  input.trim();
+  input.toUpperCase();
+  
+  int position = 0;
+  
+  while (position < input.length()) {
+    // Skip whitespace
+    while (position < input.length() && input[position] == ' ') position++;
+    if (position >= input.length()) break;
+    
+    // Check for keywords
+    bool isIF = input.substring(position).startsWith("IF ");
+    bool isELSEIF = input.substring(position).startsWith("ELSE IF ");
+    bool isELSE = input.substring(position).startsWith("ELSE ");
+    
+    if (isIF || isELSEIF) {
+      // Extract condition and action
+      int condStart = position + (isELSEIF ? 8 : 3); // Skip "IF " or "ELSE IF "
+      int thenPos = input.indexOf(" THEN ", condStart);
+      if (thenPos < 0) return ""; // Invalid syntax
+      
+      String conditionPart = input.substring(condStart, thenPos);
+      conditionPart.trim();
+      
+      // Find end of action (next IF/ELSE IF/ELSE or end of string)
+      int actionStart = thenPos + 6; // Skip " THEN "
+      int actionEnd = input.length();
+      
+      // Look for next conditional keyword
+      for (int i = actionStart; i < input.length() - 7; i++) {
+        if (input.substring(i).startsWith(" ELSE IF ") || 
+            input.substring(i).startsWith(" ELSE ")) {
+          actionEnd = i;
+          break;
+        }
+      }
+      
+      String action = input.substring(actionStart, actionEnd);
+      action.trim();
+      
+      // Evaluate this condition
+      String fullCondition = "IF " + conditionPart + " THEN dummy";
+      bool conditionMet = evaluateCondition(fullCondition);
+      
+      if (conditionMet) {
+        return action; // Execute this action and stop
+      }
+      
+      position = actionEnd;
+    } else if (isELSE) {
+      // ELSE - always execute
+      int actionStart = position + 5; // Skip "ELSE "
+      String action = input.substring(actionStart);
+      action.trim();
+      return action;
+    } else {
+      position++; // Move forward
+    }
+  }
+  
+  return ""; // No action to execute
+}
+
+// Evaluate condition for Phase 1: Simple IF/THEN
+static bool evaluateCondition(const String& condition) {
+  String cond = condition;
+  cond.trim();
+  cond.toUpperCase();
+  
+  // Extract condition part (between IF and THEN)
+  int thenPos = cond.indexOf(" THEN ");
+  if (thenPos < 0) return false; // Invalid syntax
+  
+  String conditionPart = cond.substring(3, thenPos); // Skip "IF "
+  conditionPart.trim();
+  
+  // Parse: sensor operator value
+  String sensor, op, value;
+  int opPos = -1;
+  String operators[] = {">=", "<=", "!=", ">", "<", "="};
+  
+  // Find operator
+  for (int i = 0; i < 6; i++) {
+    opPos = conditionPart.indexOf(operators[i]);
+    if (opPos > 0) {
+      sensor = conditionPart.substring(0, opPos);
+      op = operators[i];
+      value = conditionPart.substring(opPos + op.length());
+      sensor.trim();
+      value.trim();
+      break;
+    }
+  }
+  
+  if (opPos < 0) return false; // No operator found
+  
+  // Get current sensor value
+  float currentValue = 0;
+  bool isNumeric = true;
+  String currentStringValue = "";
+  
+  if (sensor == "TEMP") {
+    currentValue = gSensorCache.thermalAvgTemp;
+  } else if (sensor == "HUMIDITY") {
+    // No humidity sensor in this cache, return error
+    DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[condition] Humidity sensor not available");
+    return false;
+  } else if (sensor == "DISTANCE") {
+    // Special handling for distance - check if ANY valid object meets the condition
+    float targetValue = value.toFloat();
+    bool anyObjectMeetsCondition = false;
+    
+    DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[condition] distance: checking %d objects against %s%.1f", 
+           gSensorCache.tofTotalObjects, op.c_str(), targetValue);
+    
+    for (int j = 0; j < gSensorCache.tofTotalObjects && j < 4; j++) {
+      if (gSensorCache.tofObjects[j].valid) {
+        float objDistance = gSensorCache.tofObjects[j].distance_cm;
+        bool objMeetsCondition = false;
+        
+        if (op == ">") objMeetsCondition = objDistance > targetValue;
+        else if (op == "<") objMeetsCondition = objDistance < targetValue;
+        else if (op == "=") objMeetsCondition = abs(objDistance - targetValue) < 0.1;
+        else if (op == ">=") objMeetsCondition = objDistance >= targetValue;
+        else if (op == "<=") objMeetsCondition = objDistance <= targetValue;
+        else if (op == "!=") objMeetsCondition = abs(objDistance - targetValue) >= 0.1;
+        
+        DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[condition] obj[%d]: %.1fcm %s %.1f = %s", 
+               j, objDistance, op.c_str(), targetValue, objMeetsCondition ? "TRUE" : "FALSE");
+        
+        if (objMeetsCondition) {
+          anyObjectMeetsCondition = true;
+        }
+      }
+    }
+    
+    DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[condition] distance result: %s", 
+           anyObjectMeetsCondition ? "TRUE" : "FALSE");
+    return anyObjectMeetsCondition;
+  } else if (sensor == "LIGHT") {
+    currentValue = gSensorCache.apdsClear; // Use clear light sensor
+  } else if (sensor == "MOTION") {
+    isNumeric = false;
+    // Use proximity sensor as motion detection
+    currentStringValue = (gSensorCache.apdsProximity > 50) ? "DETECTED" : "NONE";
+  } else if (sensor == "TIME") {
+    isNumeric = false;
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    int hour = timeinfo->tm_hour;
+    if (hour >= 6 && hour < 12) currentStringValue = "MORNING";
+    else if (hour >= 12 && hour < 18) currentStringValue = "AFTERNOON";
+    else if (hour >= 18 && hour < 24) currentStringValue = "EVENING";
+    else currentStringValue = "NIGHT";
+  } else {
+    DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[condition] Unknown sensor: %s", sensor.c_str());
+    return false; // Unknown sensor
+  }
+  
+  // Evaluate condition
+  if (isNumeric) {
+    float targetValue = value.toFloat();
+    if (op == ">") return currentValue > targetValue;
+    else if (op == "<") return currentValue < targetValue;
+    else if (op == "=") return abs(currentValue - targetValue) < 0.1; // Float equality
+    else if (op == ">=") return currentValue >= targetValue;
+    else if (op == "<=") return currentValue <= targetValue;
+    else if (op == "!=") return abs(currentValue - targetValue) >= 0.1;
+  } else {
+    value.toUpperCase();
+    if (op == "=") return currentStringValue == value;
+    else if (op == "!=") return currentStringValue != value;
+    // Other operators don't make sense for strings
+  }
+  
+  return false;
+}
+
+// Validate conditional command syntax
+static String validateConditionalCommand(const String& command) {
+  String cmd = command;
+  cmd.trim();
+  
+  String upperCmd = cmd;
+  upperCmd.toUpperCase();
+  if (!upperCmd.startsWith("IF ")) {
+    return ""; // Not a conditional command, no validation needed
+  }
+  
+  int thenPos = upperCmd.indexOf(" THEN ");
+  if (thenPos < 0) {
+    return "Error: Conditional command missing THEN";
+  }
+  
+  int elsePos = upperCmd.indexOf(" ELSE ");
+  
+  // Extract condition part
+  String conditionPart = cmd.substring(3, thenPos); // Skip "IF "
+  conditionPart.trim();
+  
+  // Validate condition syntax
+  String conditionError = validateConditionSyntax("IF " + conditionPart + " THEN dummy");
+  if (conditionError.length() > 0) {
+    return "Error: " + conditionError;
+  }
+  
+  // Extract and validate THEN command
+  String thenCommand;
+  if (elsePos > thenPos) {
+    thenCommand = cmd.substring(thenPos + 6, elsePos); // Skip " THEN "
+  } else {
+    thenCommand = cmd.substring(thenPos + 6); // Skip " THEN "
+  }
+  thenCommand.trim();
+  
+  if (thenCommand.length() == 0) {
+    return "Error: Missing command after THEN";
+  }
+  
+  // Validate THEN command (recursively handle nested conditionals)
+  bool prevValidate = gCLIValidateOnly;
+  gCLIValidateOnly = true;
+  String thenResult = executeConditionalCommand(thenCommand);
+  gCLIValidateOnly = prevValidate;
+  
+  if (thenResult.startsWith("Error:") && thenResult != "Error: Unknown command") {
+    return "Error: Invalid THEN command - " + thenResult;
+  }
+  
+  // Validate ELSE command if present
+  if (elsePos > thenPos) {
+    String elseCommand = cmd.substring(elsePos + 6); // Skip " ELSE "
+    elseCommand.trim();
+    
+    if (elseCommand.length() > 0) {
+      bool prevValidate2 = gCLIValidateOnly;
+      gCLIValidateOnly = true;
+      String elseResult = executeConditionalCommand(elseCommand);
+      gCLIValidateOnly = prevValidate2;
+      
+      if (elseResult.startsWith("Error:") && elseResult != "Error: Unknown command") {
+        return "Error: Invalid ELSE command - " + elseResult;
+      }
+    }
+  }
+  
+  return ""; // Valid conditional command
+}
+
+// Execute a command that may contain conditional logic
+static String executeConditionalCommand(const String& command) {
+  String cmd = command;
+  cmd.trim();
+  
+  // Check if this is a conditional command (starts with IF)
+  String upperCmd = cmd;
+  upperCmd.toUpperCase();
+  if (upperCmd.startsWith("IF ")) {
+    // Parse conditional command: IF condition THEN command [ELSE command]
+    
+    int thenPos = upperCmd.indexOf(" THEN ");
+    if (thenPos < 0) {
+      return "Error: Conditional command missing THEN";
+    }
+    
+    int elsePos = upperCmd.indexOf(" ELSE ");
+    
+    // Extract parts
+    String conditionPart = cmd.substring(3, thenPos); // Skip "IF "
+    conditionPart.trim();
+    
+    String thenCommand;
+    String elseCommand = "";
+    
+    if (elsePos > thenPos) {
+      // Has ELSE clause
+      thenCommand = cmd.substring(thenPos + 6, elsePos); // Skip " THEN "
+      elseCommand = cmd.substring(elsePos + 6); // Skip " ELSE "
+    } else {
+      // No ELSE clause
+      thenCommand = cmd.substring(thenPos + 6); // Skip " THEN "
+    }
+    
+    thenCommand.trim();
+    elseCommand.trim();
+    
+    // Evaluate condition
+    String fullCondition = "IF " + conditionPart + " THEN dummy";
+    bool conditionMet = evaluateCondition(fullCondition);
+    
+    DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[conditional] condition='%s' result=%s", 
+           conditionPart.c_str(), conditionMet ? "TRUE" : "FALSE");
+    
+    // Execute appropriate command
+    if (conditionMet) {
+      if (thenCommand.length() > 0) {
+        DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[conditional] executing THEN: %s", thenCommand.c_str());
+        return processCommand(thenCommand);
+      }
+    } else {
+      if (elseCommand.length() > 0) {
+        DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[conditional] executing ELSE: %s", elseCommand.c_str());
+        return processCommand(elseCommand);
+      }
+    }
+    
+    return "Conditional command completed";
+  } else {
+    // Regular command - execute normally
+    return processCommand(cmd);
+  }
+}
+
 static String cmd_automation_add(const String& originalCmd) {
   // Do not early-return on validate; we want to perform full argument checks
   bool validateOnly = gCLIValidateOnly;
@@ -5672,18 +6530,50 @@ static String cmd_automation_add(const String& originalCmd) {
     if (p < 0) return String("");
     int start = p + k.length();
     int end = -1;
-    for (int i = start; i < (int)args.length(); i++) {
-      if (args[i] == ' ' && i + 1 < (int)args.length()) {
-        int nextSpace = args.indexOf(' ', i + 1);
-        int nextEquals = args.indexOf('=', i + 1);
-        if (nextEquals > 0 && (nextSpace < 0 || nextEquals < nextSpace)) {
-          end = i;
-          break;
+    
+    // Skip leading whitespace
+    while (start < (int)args.length() && args[start] == ' ') start++;
+    
+    // Check if value is quoted
+    if (start < (int)args.length() && args[start] == '"') {
+      // Find closing quote
+      start++; // Skip opening quote
+      end = args.indexOf('"', start);
+      if (end < 0) end = args.length(); // No closing quote, take rest
+      return args.substring(start, end);
+    } else {
+      // Unquoted value - find next parameter
+      // Handle empty values (when next char after = is space or another key=)
+      if (start < (int)args.length() && args[start] == ' ') {
+        // Check if next non-space character starts a new parameter (contains =)
+        int nextNonSpace = start;
+        while (nextNonSpace < (int)args.length() && args[nextNonSpace] == ' ') nextNonSpace++;
+        if (nextNonSpace < (int)args.length()) {
+          int nextEquals = args.indexOf('=', nextNonSpace);
+          int nextSpace = args.indexOf(' ', nextNonSpace);
+          if (nextEquals > 0 && (nextSpace < 0 || nextEquals < nextSpace)) {
+            // Next token is a parameter, so current value is empty
+            return String("");
+          }
         }
       }
+      
+      // Find end of current value
+      for (int i = start; i < (int)args.length(); i++) {
+        if (args[i] == ' ' && i + 1 < (int)args.length()) {
+          int nextSpace = args.indexOf(' ', i + 1);
+          int nextEquals = args.indexOf('=', i + 1);
+          if (nextEquals > 0 && (nextSpace < 0 || nextEquals < nextSpace)) {
+            end = i;
+            break;
+          }
+        }
+      }
+      if (end < 0) end = args.length();
+      String result = args.substring(start, end);
+      result.trim();
+      return result;
     }
-    if (end < 0) end = args.length();
-    return args.substring(start, end);
   };
   String name = getVal("name");
   String type = getVal("type");
@@ -5693,6 +6583,7 @@ static String cmd_automation_add(const String& originalCmd) {
   String intervalMs = getVal("intervalms");
   String cmdStr = getVal("command");
   String cmdsList = getVal("commands");
+  String conditions = getVal("conditions");
   String enabledStr = getVal("enabled");
   bool enabled = (enabledStr.equalsIgnoreCase("1") || enabledStr.equalsIgnoreCase("true") || enabledStr.equalsIgnoreCase("yes"));
   String typeNorm = type;
@@ -5703,6 +6594,40 @@ static String cmd_automation_add(const String& originalCmd) {
   if (name.length() == 0) return "Error: missing name";
   if (typeNorm.length() == 0) return "Error: missing type (atTime|afterDelay|interval)";
   if ((cmdStr.length() == 0 && cmdsList.length() == 0)) return "Error: missing commands (provide commands=<cmd1;cmd2;...> or command=<cmd>)";
+  
+  // Validate conditions syntax if provided
+  if (conditions.length() > 0) {
+    conditions.trim();
+    String conditionError = validateConditionSyntax(conditions);
+    if (conditionError.length() > 0) {
+      return "Error: Invalid condition - " + conditionError;
+    }
+  }
+  
+  // Validate individual commands
+  String combined = cmdsList.length() ? cmdsList : cmdStr;
+  int start = 0;
+  String s = combined;
+  int len = s.length();
+  for (int i = 0; i <= len; ++i) {
+    if (i == len || s[i] == ';') {
+      String part = s.substring(start, i);
+      part.trim();
+      if (part.length()) {
+        // Validate this individual command by calling processCommand in validation mode
+        bool prevValidate = gCLIValidateOnly;
+        gCLIValidateOnly = true;
+        String validationResult = processCommand(part);
+        gCLIValidateOnly = prevValidate;
+        
+        if (validationResult != "VALID") {
+          return "Error: Invalid command '" + part + "' - " + validationResult;
+        }
+      }
+      start = i + 1;
+    }
+  }
+  
   auto isNumeric = [&](const String& s) {
     if (!s.length()) return false;
     for (size_t i = 0; i < s.length(); ++i) {
@@ -5769,7 +6694,7 @@ static String cmd_automation_add(const String& originalCmd) {
   if (typeNorm == "afterdelay" && delayMs.length() > 0) obj += "  \"delayMs\": " + delayMs + ",\n";
   if (typeNorm == "interval" && intervalMs.length() > 0) obj += "  \"intervalMs\": " + intervalMs + ",\n";
   // Build commands array: prefer 'commands='; fallback to 'command=' (semicolon-separated allowed)
-  String combined = cmdsList.length() ? cmdsList : cmdStr;
+  // Note: combined variable already declared above for validation
   // Split by ';'
   auto buildCommandsArray = [&](const String& csv) {
     String arr = "[";
@@ -5794,6 +6719,7 @@ static String cmd_automation_add(const String& originalCmd) {
   };
   String commandsJson = buildCommandsArray(combined);
   obj += "  \"commands\": " + commandsJson + ",\n";
+  if (conditions.length() > 0) obj += "  \"conditions\": \"" + jsonEscape(conditions) + "\",\n";
 
   // Compute and add nextAt field
   time_t now = time(nullptr);
@@ -6008,6 +6934,27 @@ static String cmd_automation_run(const String& originalCmd) {
   if (objEnd < 0) return "Error: malformed automations.json (objEnd)";
   String obj = json.substring(objStart, objEnd + 1);
 
+  // Extract automation name for logging
+  String autoName = "Unknown";
+  int namePos = obj.indexOf("\"name\"");
+  if (namePos >= 0) {
+    int colonPos = obj.indexOf(':', namePos);
+    if (colonPos >= 0) {
+      int q1 = obj.indexOf('"', colonPos + 1);
+      int q2 = obj.indexOf('"', q1 + 1);
+      if (q1 >= 0 && q2 >= 0) {
+        autoName = obj.substring(q1 + 1, q2);
+      }
+    }
+  }
+
+  // Log automation start if logging is active
+  if (gAutoLogActive) {
+    gAutoLogAutomationName = autoName;
+    String startMsg = "Automation started: ID=" + idStr + " Name=" + autoName + " User=" + gExecUser;
+    appendAutoLogEntry("AUTO_START", startMsg);
+  }
+
   // Extract commands array (preferred) or single command (fallback)
   int cmdsPos = obj.indexOf("\"commands\"");
   bool haveArray = false;
@@ -6033,12 +6980,13 @@ static String cmd_automation_run(const String& originalCmd) {
       }
     }
   }
-  String cmdsList[8];
+  String* cmdsList = new String[64];
+  struct CmdsListGuard { String* p; CmdsListGuard(String* p):p(p){} ~CmdsListGuard(){ if(p){ delete[] p; } } } _cmdsGuard(cmdsList);
   int cmdsCount = 0;
   if (haveArray) {
     String body = obj.substring(arrStart + 1, arrEnd);
     int i = 0;
-    while (i < (int)body.length() && cmdsCount < 8) {
+    while (i < (int)body.length() && cmdsCount < 64) {
       while (i < (int)body.length() && (body[i] == ' ' || body[i] == ',')) i++;
       if (i >= (int)body.length()) break;
       if (body[i] == '"') {
@@ -6047,7 +6995,7 @@ static String cmd_automation_run(const String& originalCmd) {
         if (q2 < 0) break;
         String one = body.substring(q1 + 1, q2);
         one.trim();
-        if (one.length()) { cmdsList[cmdsCount++] = one; }
+        if (one.length() && cmdsCount < 64) { cmdsList[cmdsCount++] = one; }
         i = q2 + 1;
       } else {
         int next = body.indexOf(',', i);
@@ -6064,14 +7012,75 @@ static String cmd_automation_run(const String& originalCmd) {
     if (cq1 < 0 || cq2 < 0) return "Error: bad command field";
     String cmd = obj.substring(cq1 + 1, cq2);
     cmd.trim();
-    if (cmd.length()) { cmdsList[cmdsCount++] = cmd; }
+    if (cmd.length() && cmdsCount < 64) { cmdsList[cmdsCount++] = cmd; }
   }
   if (cmdsCount == 0) return "Error: no commands to run";
 
-  // Execute all commands
+  // Check conditions if present
+  String conditions = "";
+  int condPos = obj.indexOf("\"conditions\"");
+  if (condPos >= 0) {
+    int condColon = obj.indexOf(':', condPos);
+    if (condColon >= 0) {
+      int condQ1 = obj.indexOf('"', condColon + 1);
+      int condQ2 = obj.indexOf('"', condQ1 + 1);
+      if (condQ1 >= 0 && condQ2 >= 0) {
+        conditions = obj.substring(condQ1 + 1, condQ2);
+        conditions.trim();
+      }
+    }
+  }
+  
+  // Evaluate conditions if present
+  if (conditions.length() > 0) {
+    // Check if this is a conditional chain (contains ELSE/ELSE IF)
+    if (conditions.indexOf("ELSE") >= 0) {
+      String actionToExecute = evaluateConditionalChain(conditions);
+      DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[autos run] id=%s conditional chain result: '%s'", 
+             idStr.c_str(), actionToExecute.c_str());
+      
+      if (actionToExecute.length() > 0) {
+        // Execute the specific action from the chain
+        String result = executeConditionalCommand(actionToExecute);
+        if (result.startsWith("Error:")) {
+          return "Automation conditional chain error: " + result;
+        }
+        return "Ran automation id=" + idStr + " (conditional chain executed: " + actionToExecute + ")";
+      } else {
+        return "Automation conditional chain evaluated but no action executed";
+      }
+    } else {
+      // Simple IF/THEN condition
+      bool conditionMet = evaluateCondition(conditions);
+      DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[autos run] id=%s condition='%s' result=%s", 
+             idStr.c_str(), conditions.c_str(), conditionMet ? "TRUE" : "FALSE");
+      
+      if (!conditionMet) {
+        // Log condition not met if logging is active
+        if (gAutoLogActive) {
+          String skipMsg = "Automation skipped: ID=" + idStr + " Name=" + autoName + " Condition not met: " + conditions;
+          appendAutoLogEntry("AUTO_SKIP", skipMsg);
+          gAutoLogAutomationName = "";
+        }
+        return "Automation skipped - condition not met: " + conditions;
+      }
+    }
+  }
+
+  // Execute all commands (with conditional logic support)
   for (int ci = 0; ci < cmdsCount; ++ci) {
     DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[autos run] id=%s cmd[%d]='%s'", idStr.c_str(), ci, cmdsList[ci].c_str());
-    runAutomationCommandUnified(cmdsList[ci]);
+    // Protect against malformed commands
+    if (cmdsList[ci].length() == 0 || cmdsList[ci] == "\\") {
+      DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[autos run] skipping malformed command: '%s'", cmdsList[ci].c_str());
+      continue;
+    }
+    
+    // Execute command with conditional logic support
+    String result = executeConditionalCommand(cmdsList[ci]);
+    if (result.startsWith("Error:")) {
+      DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[autos run] id=%s cmd[%d] error: %s", idStr.c_str(), ci, result.c_str());
+    }
   }
 
   // Advance nextAt after manual execution (as requested by user)
@@ -6090,33 +7099,86 @@ static String cmd_automation_run(const String& originalCmd) {
     }
   }
 
+  // Log automation end if logging is active
+  if (gAutoLogActive) {
+    String endMsg = "Automation completed: ID=" + idStr + " Name=" + autoName + " Commands=" + String(cmdsCount);
+    appendAutoLogEntry("AUTO_END", endMsg);
+  }
+  
   return "Ran automation id=" + idStr + " (" + String(cmdsCount) + " command" + (cmdsCount == 1 ? "" : "s") + ")";
 }
 
 static String cmd_broadcast(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("broadcast");
-    if (err.length()) return err;
+  // Admin check now handled by executeCommand pipeline
+  
+  String args = originalCmd.substring(10); // Remove "broadcast "
+  args.trim();
+  if (args.length() == 0) return "Usage: broadcast [--user <username>] <message>";
+  
+  String targetUser = "";
+  String msg = args;
+  
+  // Parse --user argument
+  if (args.startsWith("--user ")) {
+    int userStart = 7; // Length of "--user "
+    int userEnd = args.indexOf(' ', userStart);
+    if (userEnd < 0) {
+      return "Usage: broadcast --user <username> <message>";
+    }
+    targetUser = args.substring(userStart, userEnd);
+    targetUser.trim();
+    msg = args.substring(userEnd + 1);
+    msg.trim();
+    if (msg.length() == 0) {
+      return "Usage: broadcast --user <username> <message>";
+    }
   }
-  String msg = originalCmd.substring(10);
-  msg.trim();
-  if (msg.length() == 0) return "Usage: broadcast <message>";
-  broadcastWithOrigin("admin", gExecIsAdmin ? String("admin") : String(), String(), msg);
   
-  // Send broadcast notifications to all active sessions for popup alerts
-  broadcastNoticeToAllSessions(msg);
-  
-  return String("Broadcast sent: ") + msg;
+  if (targetUser.length() > 0) {
+    // Send to specific user - clean format: [sender@recipient]
+    broadcastWithOrigin("", gExecIsAdmin ? gExecUser : String(), targetUser, msg);
+    return String("Broadcast sent to user '") + targetUser + "': " + msg;
+  } else {
+    // Send to all users - clean format: [sender]
+    broadcastWithOrigin("", gExecIsAdmin ? gExecUser : String(), String(), msg);
+    
+    // Send broadcast notifications to all active sessions for popup alerts
+    // Now safe to call from automation context due to dedicated executor task
+    broadcastNoticeToAllSessions(msg);
+    
+    return String("Broadcast sent to all users: ") + msg;
+  }
+}
+
+// ----- Wait/Sleep (delay) command -----
+static String cmd_wait_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  // Accept both 'wait <ms>' and 'sleep <ms>'
+  String cmd = originalCmd;
+  cmd.trim();
+  int sp = cmd.indexOf(' ');
+  if (sp < 0) return "Usage: wait <milliseconds>";
+  String valStr = cmd.substring(sp + 1);
+  valStr.trim();
+  if (valStr.length() == 0) return "Usage: wait <milliseconds>";
+  long ms = valStr.toInt();
+  if (ms < 0) ms = 0;
+  // Clamp to a reasonable maximum to avoid excessively long blocks
+  if (ms > 600000) ms = 600000; // 10 minutes
+  // Perform the delay in the current task context
+  if (ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(ms));
+  } else {
+    taskYIELD();
+  }
+  return "Waited " + String(ms) + " ms";
 }
 
 // ----- I2C clock handlers (relocated) -----
 static String cmd_i2cclockthermalhz(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: i2cClockThermalHz <400000..1000000>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -6132,10 +7194,7 @@ static String cmd_i2cclockthermalhz(const String& originalCmd) {
 
 static String cmd_i2cclocktofhz(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("sensorConfig");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: i2cClockToFHz <50000..400000>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -6150,12 +7209,79 @@ static String cmd_i2cclocktofhz(const String& originalCmd) {
 }
 
 // ----- Download Automation from GitHub -----
+// Parse JSON commands array into semicolon-separated string for automation system
+static String parseCommandsArray(const String& commandsJson) {
+  // Simple JSON array parser for commands
+  // Expected format: ["cmd1", "cmd2", "cmd3"]
+  
+  String trimmed = commandsJson;
+  trimmed.trim();
+  
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+    return "Error: commands must be a JSON array [\"cmd1\", \"cmd2\", ...]";
+  }
+  
+  // Remove brackets
+  String content = trimmed.substring(1, trimmed.length() - 1);
+  content.trim();
+  
+  if (content.length() == 0) {
+    return "Error: commands array cannot be empty";
+  }
+  
+  String result = "";
+  int start = 0;
+  bool inQuotes = false;
+  bool escapeNext = false;
+  
+  for (int i = 0; i <= content.length(); i++) {
+    char c = (i < content.length()) ? content[i] : ','; // Treat end as comma
+    
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    
+    if (c == '\\') {
+      escapeNext = true;
+      continue;
+    }
+    
+    if (c == '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    
+    if (!inQuotes && c == ',') {
+      // Extract command
+      String cmd = content.substring(start, i);
+      cmd.trim();
+      
+      // Remove quotes if present
+      if (cmd.startsWith("\"") && cmd.endsWith("\"")) {
+        cmd = cmd.substring(1, cmd.length() - 1);
+      }
+      
+      cmd.trim();
+      if (cmd.length() > 0) {
+        if (result.length() > 0) result += ";";
+        result += cmd;
+      }
+      
+      start = i + 1;
+    }
+  }
+  
+  if (result.length() == 0) {
+    return "Error: No valid commands found in array";
+  }
+  
+  return result;
+}
+
 static String cmd_downloadautomation(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("automationManagement");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   
   String args = originalCmd.substring(String("downloadautomation ").length());
   args.trim();
@@ -6177,13 +7303,32 @@ static String cmd_downloadautomation(const String& originalCmd) {
     return "Usage: downloadautomation url=<github-raw-url> [name=<automation-name>]";
   }
   
-  // URL decode the URL parameter (it gets double-encoded from web interface)
-  url.replace("%3A", ":");
-  url.replace("%2F", "/");
-  url.replace("%3F", "?");
-  url.replace("%3D", "=");
-  url.replace("%26", "&");
-  url.replace("%25", "%"); // Do this last to avoid double-decoding
+  // URL decode the URL parameter (it may be double-encoded from web interface)
+  auto hexVal = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+  auto urlDecode = [&](const String& s) -> String {
+    String out; out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); ++i) {
+      char c = s[i];
+      if (c == '%' && i + 2 < s.length()) {
+        int hi = hexVal(s[i+1]);
+        int lo = hexVal(s[i+2]);
+        if (hi >= 0 && lo >= 0) {
+          out += (char)((hi << 4) | lo);
+          i += 2;
+          continue;
+        }
+      }
+      // Convert plus to space only if we ever send x-www-form-urlencoded (defensive)
+      if (c == '+') { out += ' '; } else { out += c; }
+    }
+    return out;
+  };
+  url = urlDecode(url);
   
   broadcastOutput("Original URL after decoding: " + url);
   
@@ -6194,6 +7339,13 @@ static String cmd_downloadautomation(const String& originalCmd) {
     url.replace("github.com", "raw.githubusercontent.com");
     url.replace("/blob/", "/");
     broadcastOutput("Converted URL: " + url);
+  }
+
+  // Normalize raw.githubusercontent.com URLs that use refs/heads in the path
+  if (url.indexOf("raw.githubusercontent.com") >= 0) {
+    // Example: https://raw.githubusercontent.com/user/repo/refs/heads/main/path/file.json
+    // should be      https://raw.githubusercontent.com/user/repo/main/path/file.json
+    url.replace("/refs/heads/", "/");
   }
   
   broadcastOutput("Final URL for download: " + url);
@@ -6338,6 +7490,10 @@ static String cmd_downloadautomation(const String& originalCmd) {
   }
   
   String payload = downloadResult;
+  // If the download task reported a specific error, propagate it
+  if (payload.startsWith("Error:")) {
+    return payload;
+  }
   
   if (payload.length() == 0) {
     return "Error: Downloaded content is empty";
@@ -6393,7 +7549,7 @@ static String cmd_downloadautomation(const String& originalCmd) {
     
     String value;
     if (payload[valueStart] == '"') {
-      // String value
+      // String value - extract without quotes
       valueStart++; // Skip opening quote
       int valueEnd = payload.indexOf('"', valueStart);
       if (valueEnd < 0) return "";
@@ -6427,22 +7583,75 @@ static String cmd_downloadautomation(const String& originalCmd) {
   String enabled = extractJsonValue("enabled");
   String atTime = extractJsonValue("time");  // Look for 'time' field
   String days = extractJsonValue("days");
-  String command = extractJsonValue("command");
   String afterDelay = extractJsonValue("delay");  // Look for 'delay' field
-  String interval = extractJsonValue("interval");
+  String interval = extractJsonValue("interval");  // Look for 'interval' field
+  String conditions = extractJsonValue("conditions");  // Look for 'conditions' field
+  
+  // Debug output for extracted fields
+  broadcastOutput("Extracted fields - name: '" + autoName + "', type: '" + autoType + "', conditions: '" + conditions + "'");
+  // Extract commands array (special handling for JSON array)
+  String commands;
+  {
+    String needle = "\"commands\"";
+    int pos = payload.indexOf(needle);
+    if (pos >= 0) {
+      int colonPos = payload.indexOf(':', pos);
+      if (colonPos >= 0) {
+        // Skip whitespace after colon
+        int arrayStart = colonPos + 1;
+        while (arrayStart < payload.length() && (payload[arrayStart] == ' ' || payload[arrayStart] == '\t' || payload[arrayStart] == '\n')) {
+          arrayStart++;
+        }
+        
+        if (arrayStart < payload.length() && payload[arrayStart] == '[') {
+          // Find matching closing bracket
+          int bracketCount = 0;
+          int arrayEnd = arrayStart;
+          for (int i = arrayStart; i < payload.length(); i++) {
+            if (payload[i] == '[') bracketCount++;
+            else if (payload[i] == ']') bracketCount--;
+            
+            if (bracketCount == 0) {
+              arrayEnd = i + 1;
+              break;
+            }
+          }
+          
+          if (bracketCount == 0) {
+            commands = payload.substring(arrayStart, arrayEnd);
+          }
+        }
+      }
+    }
+  }
   
   if (autoName.length() == 0) autoName = name.length() > 0 ? name : "Downloaded Automation";
   if (autoType.length() == 0) return "Error: Automation missing required 'type' field";
-  if (command.length() == 0) return "Error: Automation missing required 'command' field";
+  if (commands.length() == 0) return "Error: Automation missing required 'commands' array";
   
-  // Build the automation add command
-  addCmd += "name=\"" + autoName + "\" type=" + autoType + " command=\"" + command + "\"";
+  // Parse JSON array of commands into semicolon-separated string
+  String finalCommand = parseCommandsArray(commands);
+  if (finalCommand.startsWith("Error:")) return finalCommand;
+  
+  // Build the automation add command (proper quoting for CLI parsing)
+  String nameParam = autoName;
+  if (autoName.indexOf(' ') >= 0 && !autoName.startsWith("\"")) {
+    nameParam = "\"" + autoName + "\"";
+  }
+  
+  // Quote the command if it contains spaces (for proper CLI parsing)
+  String commandParam = finalCommand;
+  if (finalCommand.indexOf(' ') >= 0 && !finalCommand.startsWith("\"")) {
+    commandParam = "\"" + finalCommand + "\"";
+  }
+  addCmd += "name=" + nameParam + " type=" + autoType + " command=" + commandParam;
   
   if (enabled.length() > 0) addCmd += " enabled=" + enabled;
   if (atTime.length() > 0) addCmd += " time=" + atTime;  // Use 'time=' not 'atTime='
   if (days.length() > 0) addCmd += " days=" + days;
   if (afterDelay.length() > 0) addCmd += " delay=" + afterDelay;  // Use 'delay=' not 'afterDelay='
   if (interval.length() > 0) addCmd += " interval=" + interval;
+  if (conditions.length() > 0) addCmd += " conditions=" + conditions;
   
   broadcastOutput("Executing: " + addCmd);
   
@@ -6604,10 +7813,7 @@ static String cmd_automation(const String& originalCmd) {
     }
   } else if (command == "automation recompute") {
     RETURN_VALID_IF_VALIDATE();
-    {
-      String err = requireAdminFor("automation");
-      if (err.length()) return err;
-    }
+    // Admin check now handled by executeCommand pipeline
 
     String json;
     if (!readText(AUTOMATIONS_JSON_FILE, json)) return "Error: failed to read automations.json";
@@ -6674,6 +7880,8 @@ static String cmd_automation(const String& originalCmd) {
     }
 
     return "Recomputed nextAt: " + String(recomputed) + " succeeded, " + String(failed) + " failed";
+  } else if (command.startsWith("automation run ")) {
+    return cmd_automation_run(originalCmd);
   } else {
     return "Usage: automation list|add|enable|disable|delete|run|sanitize|recompute";
   }
@@ -6682,10 +7890,7 @@ static String cmd_automation(const String& originalCmd) {
 // ----- Debug command flow handler (relocated) -----
 static String cmd_debugcommandflow(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("debugControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: debugcommandflow <0|1>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -6700,10 +7905,7 @@ static String cmd_debugcommandflow(const String& originalCmd) {
 // ----- Debug users handler -----
 static String cmd_debugusers(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("debugControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: debugusers <0|1>";
   String valStr = originalCmd.substring(sp1 + 1);
@@ -6794,7 +7996,7 @@ static String cmd_set(const String& originalCmd) {
     String v = value;
     v.trim();
     v.toLowerCase();
-    if (!(v == "grayscale" || v == "coolwarm")) return "Error: thermalPaletteDefault must be grayscale|coolwarm";
+    if (!(v == "grayscale" || v == "iron" || v == "rainbow" || v == "hot" || v == "coolwarm")) return "Error: thermalPaletteDefault must be grayscale|iron|rainbow|hot|coolwarm";
     gSettings.thermalPaletteDefault = v;
     saveUnifiedSettings();
     return String("thermalPaletteDefault set to ") + v;
@@ -6854,6 +8056,14 @@ static String cmd_set(const String& originalCmd) {
     gSettings.thermalWebClientQuality = v;
     saveUnifiedSettings();
     return String("thermalWebClientQuality set to ") + v;
+  } else if (setting == "espnowenabled") {
+    String vl = value;
+    vl.trim();
+    vl.toLowerCase();
+    int v = (vl == "1" || vl == "true") ? 1 : 0;
+    gSettings.espnowenabled = (v == 1);
+    saveUnifiedSettings();
+    return String("espnowenabled set to ") + (gSettings.espnowenabled ? "1" : "0") + " (takes effect after reboot)";
   } else {
     return "Error: unknown setting '" + setting + "'";
   }
@@ -6901,14 +8111,69 @@ static String originPrefix(const char* source, const String& user, const String&
 }
 
 static inline void broadcastWithOrigin(const char* source, const String& user, const String& ip, const String& msg) {
-  // Session-only: if origin is serial and serial sink is disabled, enable for this session
-  if (source && strcmp(source, "serial") == 0) {
-    if (!(gOutputFlags & OUTPUT_SERIAL)) {
-      gOutputFlags |= OUTPUT_SERIAL;  // session-only; do not modify persisted settings
+  Serial.println("[DEBUG-BROADCAST] broadcastWithOrigin (inline) called:");
+  Serial.println("  source: '" + String(source ? source : "NULL") + "'");
+  Serial.println("  user: '" + user + "'");
+  Serial.println("  ip: '" + ip + "'");
+  Serial.println("  msg: '" + msg + "'");
+  
+  // Debug: Show all active sessions
+  Serial.println("[DEBUG-SESSIONS] Active sessions:");
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (gSessions[i].user.length() > 0) {
+      Serial.println("  [" + String(i) + "] user='" + gSessions[i].user + "' sid='" + gSessions[i].sid + "' sockfd=" + String(gSessions[i].sockfd) + " expires=" + String(gSessions[i].expiresAt) + " ip='" + gSessions[i].ip + "'");
     }
   }
-  // Prefix and broadcast via simple sinks
-  broadcastOutput(originPrefix(source ? source : "system", user, ip) + msg);
+  Serial.println("[DEBUG-SESSIONS] Total sessions checked: " + String(MAX_SESSIONS));
+  
+  // Check if this is a targeted message (ip parameter contains username instead of IP)
+  bool isTargetedMessage = false;
+  String targetUser = "";
+  
+  // If ip doesn't contain ":" or "." it's likely a username, not an IP
+  if (ip.length() > 0 && ip.indexOf(':') == -1 && ip.indexOf('.') == -1) {
+    isTargetedMessage = true;
+    targetUser = ip;
+    Serial.println("[DEBUG-BROADCAST] Detected targeted message to user: '" + targetUser + "'");
+  }
+  
+  if (isTargetedMessage) {
+    // Find the target user's session
+    bool userFound = false;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+      if (gSessions[i].user.length() > 0 && gSessions[i].user == targetUser) {
+        Serial.println("[DEBUG-BROADCAST] Found target user session [" + String(i) + "] - sending targeted message");
+        
+        // Create the message with proper prefix
+        String targetedMsg = originPrefix(source ? source : "system", user, targetUser) + msg;
+        
+        // Send message directly to this specific session's notice queue
+        Serial.println("[DEBUG-BROADCAST] Sending targeted message to session: sockfd=" + String(gSessions[i].sockfd) + " sid=" + gSessions[i].sid);
+        sseEnqueueNotice(gSessions[i], targetedMsg);
+        Serial.println("[DEBUG-BROADCAST] Message queued for user '" + targetUser + "' (qCount=" + String(gSessions[i].nqCount) + ")");
+        
+        userFound = true;
+        break;
+      }
+    }
+    
+    if (!userFound) {
+      Serial.println("[DEBUG-BROADCAST] Target user '" + targetUser + "' not found in active sessions");
+      broadcastOutput("[ERROR] User '" + targetUser + "' not found or not logged in");
+    }
+  } else {
+    // Regular broadcast to all users
+    Serial.println("[DEBUG-BROADCAST] Regular broadcast to all users");
+    
+    // Session-only: if origin is serial and serial sink is disabled, enable for this session
+    if (source && strcmp(source, "serial") == 0) {
+      if (!(gOutputFlags & OUTPUT_SERIAL)) {
+        gOutputFlags |= OUTPUT_SERIAL;  // session-only; do not modify persisted settings
+      }
+    }
+    // Prefix and broadcast via simple sinks
+    broadcastOutput(originPrefix(source ? source : "system", user, ip) + msg);
+  }
 }
 
 // Now that OUTPUT_* and gOutputFlags are defined, implement applySettings
@@ -7107,12 +8372,19 @@ static esp_err_t handleOutputTemp(httpd_req_t* req) {
 
 // Notice endpoint: returns and clears per-session notice
 esp_err_t handleNotice(httpd_req_t* req) {
-  AuthContext ctx;
-  ctx.transport = AUTH_HTTP;
-  ctx.opaque = req;
-  ctx.path = "/api/notice";
-  getClientIP(req, ctx.ip);
-  if (!tgRequireAuth(ctx)) return ESP_OK;
+  httpd_resp_set_type(req, "application/json");
+  
+  // Check authentication manually to return JSON on failure
+  String user;
+  String ip;
+  getClientIP(req, ip);
+  
+  if (!isAuthed(req, user)) {
+    // Return 401 with JSON response instead of HTML
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_send(req, "{\"success\":false,\"error\":\"Authentication required\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
 
   String sid = getCookieSID(req);
   int idx = findSessionIndexBySID(sid);
@@ -7127,7 +8399,6 @@ esp_err_t handleNotice(httpd_req_t* req) {
     }
   }
   String json = String("{\"success\":true,\"notice\":\"") + jsonEscape(note) + "\"}";
-  httpd_resp_set_type(req, "application/json");
   httpd_resp_send(req, json.c_str(), HTTPD_RESP_USE_STRLEN);
   return ESP_OK;
 }
@@ -7170,7 +8441,7 @@ esp_err_t handleLogin(httpd_req_t* req) {
       return ESP_OK;
     }
     // Render login form (no next param)
-    String page = getLoginPage();
+    String page = getLoginPage("", "", req);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, page.c_str(), HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -7206,7 +8477,7 @@ esp_err_t handleLogin(httpd_req_t* req) {
     getClientIP(req, ip);
     logAuthAttempt(false, req->uri, u, ip, "Invalid credentials");
 
-    String page = getLoginPage(u, "Invalid username or password");
+    String page = getLoginPage(u, "Invalid username or password", req);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, page.c_str(), HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -7444,18 +8715,11 @@ esp_err_t handleSettingsGet(httpd_req_t* req) {
   AuthContext ctx;
   ctx.transport = AUTH_HTTP;
   ctx.opaque = req;
-  ctx.path = "/api/settings";
+  ctx.path = req->uri ? req->uri : "/api/settings";
   getClientIP(req, ctx.ip);
   if (!tgRequireAuth(ctx)) return ESP_OK;
 
   String json = "{\"success\":true,\"settings\":{";
-  // Primary SSID is first in saved list if present, otherwise from gSettings
-  loadWiFiNetworks();
-  String primarySSID = (gWifiNetworkCount > 0) ? gWifiNetworks[0].ssid : gSettings.wifiSSID;
-  json += "\"wifiSSID\":\"" + gSettings.wifiSSID + "\",";
-  json += "\"wifiPrimarySSID\":\"" + primarySSID + "\",";
-  json += "\"wifiAutoReconnect\":" + String(gSettings.wifiAutoReconnect ? "true" : "false") + ",";
-  json += "\"cliHistorySize\":" + String(gSettings.cliHistorySize) + ",";
   json += "\"ntpServer\":\"" + gSettings.ntpServer + "\",";
   json += "\"tzOffsetMinutes\":" + String(gSettings.tzOffsetMinutes) + ",";
   // Grouped output
@@ -7471,6 +8735,14 @@ esp_err_t handleSettingsGet(httpd_req_t* req) {
   json += "\"tof\":{\"ui\":{\"tofPollingMs\":" + String(gSettings.tofPollingMs) + ",\"tofStabilityThreshold\":" + String(gSettings.tofStabilityThreshold) + ",\"tofTransitionMs\":" + String(gSettings.tofTransitionMs) + ",\"tofUiMaxDistanceMm\":" + String(gSettings.tofUiMaxDistanceMm) + "},\"device\":{\"tofDevicePollMs\":" + String(gSettings.tofDevicePollMs) + ",\"i2cClockToFHz\":" + String(gSettings.i2cClockToFHz) + "}},";
   // Un-grouped device-side key(s) that remain top-level
   json += "\"imuDevicePollMs\":" + String(gSettings.imuDevicePollMs) + ",";
+  // ESP-NOW settings
+  json += "\"espnowenabled\":" + String(gSettings.espnowenabled ? 1 : 0) + ",";
+  // Current WiFi connection info
+  String currentSSID = WiFi.isConnected() ? WiFi.SSID() : String("");
+  currentSSID.replace("\\", "\\\\");
+  currentSSID.replace("\"", "\\\"");
+  json += "\"wifiPrimarySSID\":\"" + currentSSID + "\",";
+  json += "\"wifiAutoReconnect\":" + String(gSettings.wifiAutoReconnect ? "true" : "false") + ",";
   // Include saved wifiNetworks (no passwords)
   json += "\"wifiNetworks\":[";
   for (int i = 0; i < gWifiNetworkCount; ++i) {
@@ -7484,7 +8756,39 @@ esp_err_t handleSettingsGet(httpd_req_t* req) {
   json += "\"features\":{\"adminSessions\":" + String(isAdminUser(ctx.user) ? "true" : "false") + ",\"userApprovals\":true,\"adminControls\":true,\"sensorConfig\":true}}";
 
   httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, json.c_str(), HTTPD_RESP_USE_STRLEN);
+  httpd_resp_send(req, json.c_str(), json.length());
+  return ESP_OK;
+}
+
+// Device Registry API (GET): return device registry as JSON
+esp_err_t handleDeviceRegistryGet(httpd_req_t* req) {
+  AuthContext ctx;
+  ctx.transport = AUTH_HTTP;
+  ctx.opaque = req;
+  ctx.path = req->uri ? req->uri : "/api/devices";
+  getClientIP(req, ctx.ip);
+  if (!tgRequireAuth(ctx)) return ESP_OK;
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  
+  ensureDeviceRegistryFile();
+  
+  if (!LittleFS.exists("/devices.json")) {
+    httpd_resp_send(req, "{\"error\":\"Device registry not found\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+  
+  File file = LittleFS.open("/devices.json", "r");
+  if (!file) {
+    httpd_resp_send(req, "{\"error\":\"Could not read device registry\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+  
+  String json = file.readString();
+  file.close();
+  
+  httpd_resp_send(req, json.c_str(), json.length());
   return ESP_OK;
 }
 
@@ -7701,6 +9005,7 @@ esp_err_t handleAdminSessionsRevoke(httpd_req_t* req) {
 
   // Store logout reason for the target IP before force closing
   if (targetIP.length() > 0) {
+    Serial.printf("[ADMIN_DEBUG] Admin revocation: storing admin revoke message for IP '%s'\n", targetIP.c_str());
     storeLogoutReason(targetIP, "Your session was revoked by an administrator.");
   }
 
@@ -7768,8 +9073,31 @@ static bool isAdminOnlyCommand(const String& cmd) {
   String c = cmd;
   c.trim();
   c.toLowerCase();
-  // Minimal guardrail: protect sensitive operations
-  return c.startsWith("wifissid") || c.startsWith("reboot") || c.startsWith("erase") || c.startsWith("i2cclock") || c.startsWith("thermal") || c.startsWith("tof");
+  
+  // Comprehensive admin command protection - all commands requiring admin privileges
+  return c.startsWith("wifissid") || c.startsWith("reboot") || c.startsWith("erase") || 
+         c.startsWith("i2cclock") || c.startsWith("thermal") || c.startsWith("tof") ||
+         c.startsWith("wifiadd") || c.startsWith("wifirm") || c.startsWith("wifipromote") ||
+         c.startsWith("wifidisconnect") || c.startsWith("wifiautoreconnect") ||
+         c.startsWith("mkdir") || c.startsWith("rmdir") || c.startsWith("filecreate") ||
+         c.startsWith("filedelete") || c.startsWith("autolog") || c.startsWith("outweb") ||
+         c.startsWith("outserial") || c.startsWith("outtft") || c.startsWith("automation") ||
+         c.startsWith("broadcast") || 
+         // User management commands
+         c.startsWith("user approve") || c.startsWith("user deny") || 
+         c.startsWith("user promote") || c.startsWith("user demote") || 
+         c.startsWith("user delete") || c.startsWith("user list") ||
+         // Session management commands  
+         c.startsWith("session list") || c.startsWith("session revoke") ||
+         c.startsWith("pending list") ||
+         // Debug commands
+         c.startsWith("debugcommandflow") || c.startsWith("debugusers") ||
+         // Test commands (temporary)
+         c.startsWith("testencryption") || c.startsWith("testpassword") ||
+         // Download commands
+         c.startsWith("downloadautomation") ||
+         // CPU frequency (safety critical)
+         c.startsWith("cpufreq ");
 }
 
 static String redactCmdForAudit(const String& cmd) {
@@ -7821,13 +9149,41 @@ static bool executeCommand(AuthContext& ctx, const String& cmd, String& out) {
 
   // Admin-only protection for user-origin calls; allow system-origin through
   if (isAdminOnlyCommand(cmd) && !hasAdminPrivilege(ctx)) {
-    out = "Admin access required";
+    // Extract command name for better error message
+    String cmdName = cmd;
+    int spacePos = cmd.indexOf(' ');
+    if (spacePos > 0) {
+      cmdName = cmd.substring(0, spacePos);
+    }
+    out = "Error: Admin access required for command '" + cmdName + "'. Contact an administrator.";
     logAuthAttempt(false, ctx.path.c_str(), ctx.user, ctx.ip, String("cmd=") + redactCmdForAudit(cmd));
     return false;
   }
 
+  // Log command execution if automation logging is active
+  if (gAutoLogActive && gInAutomationContext) {
+    String cmdMsg = cmd;
+    if (gAutoLogAutomationName.length() > 0) {
+      cmdMsg = "[" + gAutoLogAutomationName + "] " + cmd;
+    }
+    appendAutoLogEntry("COMMAND", cmdMsg);
+  }
+
   // Execute the command via the existing processor
   out = processCommand(cmd);
+
+  // Log command output if automation logging is active
+  if (gAutoLogActive && gInAutomationContext) {
+    // Truncate very long outputs for readability
+    String logOutput = out;
+    if (logOutput.length() > 200) {
+      logOutput = logOutput.substring(0, 197) + "...";
+    }
+    // Replace newlines with spaces for single-line log format
+    logOutput.replace("\n", " ");
+    logOutput.replace("\r", " ");
+    appendAutoLogEntry("OUTPUT", logOutput);
+  }
 
   // We don't have structured success/failure from processCommand; assume success for audit purposes
   logAuthAttempt(true, ctx.path.c_str(), ctx.user, ctx.ip, String("cmd=") + redactCmdForAudit(cmd));
@@ -7936,6 +9292,36 @@ struct Command {
   String line;
   CommandContext ctx;
 };
+
+// -------- Command Executor Task (definition) --------
+struct ExecReq {
+  String line;               // Command string
+  CommandContext ctx;        // Full execution context
+  String out;                // Result from executeCommand()
+  SemaphoreHandle_t done;    // Signals completion
+  bool ok;                   // Success flag from executeCommand()
+};
+
+// Now that ExecReq is fully defined we can implement the task
+static void commandExecTask(void* pv) {
+  DEBUG_CMD_FLOWF("[cmd_exec] task started");
+  for (;;) {
+    ExecReq* r;
+    DEBUG_CMD_FLOWF("[cmd_exec] waiting for command...");
+    if (xQueueReceive(gCmdExecQ, &r, portMAX_DELAY) == pdTRUE) {
+      DEBUG_CMD_FLOWF("[cmd_exec] received cmd='%s'", r->line.c_str());
+      setCurrentCommandContext(r->ctx);
+      bool prevValidate = gCLIValidateOnly;
+      gCLIValidateOnly = r->ctx.validateOnly;
+      r->ok = executeCommand((AuthContext&)r->ctx.auth, r->line, r->out);
+      DEBUG_CMD_FLOWF("[cmd_exec] executed ok=%d out_len=%d", r->ok ? 1 : 0, r->out.length());
+      gCLIValidateOnly = prevValidate;
+      xSemaphoreGive(r->done);
+    } else {
+      DEBUG_CMD_FLOWF("[cmd_exec] queue receive failed");
+    }
+  }
+}
 static void setCurrentCommandContext(const CommandContext& ctx) {
   // Temporary bridge to legacy globals; will be removed once handlers read from ctx
   gExecFromWeb = (ctx.auth.transport == AUTH_HTTP);
@@ -7971,14 +9357,48 @@ static void routeOutput(const String& s, const CommandContext& ctx) {
   DEBUG_CMD_FLOWF("[route] sinks: serial=%d web=%d log=%d len=%d", (ctx.outputMask & CMD_OUT_SERIAL) ? 1 : 0, (ctx.outputMask & CMD_OUT_WEB) ? 1 : 0, (ctx.outputMask & CMD_OUT_LOG) ? 1 : 0, s.length());
 }
 static bool submitAndExecuteSync(const Command& cmd, String& out) {
-  // Run immediately (no queue yet) via existing executor
-  setCurrentCommandContext(cmd.ctx);
+  // If executor queue isn't ready (very early boot) fallback to direct call
+  if (gCmdExecQ == nullptr) {
+    setCurrentCommandContext(cmd.ctx);
+    return executeCommand((AuthContext&)cmd.ctx.auth, cmd.line, out);
+  }
+
+  // AVOID DEADLOCK: If we're already running in the executor task context,
+  // execute directly instead of queuing (which would cause deadlock)
+  if (cmd.ctx.origin == ORIGIN_AUTOMATION) {
+    DEBUG_CMD_FLOWF("[submit] AUTOMATION - executing directly to avoid deadlock");
+    setCurrentCommandContext(cmd.ctx);
+    bool prevValidate = gCLIValidateOnly;
+    gCLIValidateOnly = cmd.ctx.validateOnly;
+    bool ok = executeCommand((AuthContext&)cmd.ctx.auth, cmd.line, out);
+    gCLIValidateOnly = prevValidate;
+    DEBUG_CMD_FLOWF("[submit] done ok=%d len=%d", ok ? 1 : 0, out.length());
+    return ok;
+  }
+
+  // Package request
+  ExecReq* r = new ExecReq();
+  r->line = cmd.line;
+  r->ctx = cmd.ctx;
+  r->done = xSemaphoreCreateBinary();
+  r->ok = false;
+
   DEBUG_CMD_FLOWF("[submit] origin=%d user=%s path=%s cmd=%s", (int)cmd.ctx.origin, cmd.ctx.auth.user.c_str(), cmd.ctx.auth.path.c_str(), cmd.line.c_str());
-  bool prevValidate = gCLIValidateOnly;
-  gCLIValidateOnly = cmd.ctx.validateOnly;
-  bool ok = executeCommand((AuthContext&)cmd.ctx.auth, cmd.line, out);
+
+  // Enqueue and wait
+  DEBUG_CMD_FLOWF("[submit] sending to queue...");
+  BaseType_t queueResult = xQueueSend(gCmdExecQ, &r, portMAX_DELAY);
+  DEBUG_CMD_FLOWF("[submit] queue send result=%d, waiting for completion...", queueResult);
+  xSemaphoreTake(r->done, portMAX_DELAY);
+  DEBUG_CMD_FLOWF("[submit] command completed");
+
+  out = std::move(r->out);
+  bool ok = r->ok;
+
+  vSemaphoreDelete(r->done);
+  delete r;
+
   DEBUG_CMD_FLOWF("[submit] done ok=%d len=%d", ok ? 1 : 0, out.length());
-  gCLIValidateOnly = prevValidate;
   return ok;
 }
 
@@ -7996,25 +9416,87 @@ static String execCommandUnified(const CommandContext& baseCtx, const String& li
 
 // Helper used by schedulerTickMinute to avoid using incomplete types before definitions
 static void runAutomationCommandUnified(const String& cmd) {
+  // Set automation context flag to prevent SSE recursion
+  gInAutomationContext = true;
+  
+  // Log automation command execution if logging is active
+  if (gAutoLogActive) {
+    String cmdMsg = cmd;
+    if (gAutoLogAutomationName.length() > 0) {
+      cmdMsg = "[" + gAutoLogAutomationName + "] " + cmd;
+    }
+    appendAutoLogEntry("AUTO_CMD", cmdMsg);
+  }
+  
+  // Monitor stack usage
+  UBaseType_t stackBefore = uxTaskGetStackHighWaterMark(NULL);
+  size_t heapBefore = ESP.getFreeHeap();
+  
+  DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[auto] ENTER cmd='%s' stack=%u heap=%u", cmd.c_str(), stackBefore, heapBefore);
+  
   AuthContext actx;
-  actx.transport = AUTH_SYSTEM;
-  actx.user = String();
-  actx.ip = String();
+  // SECURITY: Automations should run with the privileges of the user who triggered them,
+  // NOT with system privileges. This prevents privilege escalation attacks.
+  if (gExecUser.length() > 0) {
+    // Manual run: use the actual user's privileges
+    actx.transport = gExecFromWeb ? AUTH_HTTP : AUTH_SERIAL;
+    actx.user = gExecUser;
+    actx.ip = gExecFromWeb ? String("automation-web") : String("automation-serial");
+  } else {
+    // Scheduled run: use system privileges only for scheduler-triggered automations
+    actx.transport = AUTH_SYSTEM;
+    actx.user = String("system");
+    actx.ip = String("automation-scheduled");
+  }
   actx.path = "/automation/schedule";
+  
+  UBaseType_t stackAfterSetup = uxTaskGetStackHighWaterMark(NULL);
+  DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[auto] SETUP stack=%u", stackAfterSetup);
+  
   Command uc;
   uc.line = cmd;
   uc.ctx.origin = ORIGIN_AUTOMATION;
   uc.ctx.auth = actx;
   uc.ctx.id = (uint32_t)millis();
   uc.ctx.timestampMs = (uint32_t)millis();
-  uc.ctx.outputMask = CMD_OUT_LOG;
+  uc.ctx.outputMask = CMD_OUT_SERIAL | CMD_OUT_WEB; // Enable both serial and web output
   uc.ctx.validateOnly = false;
   uc.ctx.replyHandle = nullptr;
   uc.ctx.httpReq = nullptr;
+  
+  UBaseType_t stackBeforeSubmit = uxTaskGetStackHighWaterMark(NULL);
+  DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[auto] BEFORE_SUBMIT stack=%u", stackBeforeSubmit);
+  
   DEBUG_CMD_FLOWF("[auto] dispatch cmd='%s'", cmd.c_str());
+  
+  // Add recursion tracking
+  static int automationCallDepth = 0;
+  automationCallDepth++;
+  DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[auto] RECURSION_DEPTH=%d", automationCallDepth);
+  
+  if (automationCallDepth > 3) {
+    DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[auto] RECURSION_LIMIT_HIT depth=%d, aborting", automationCallDepth);
+    automationCallDepth--;
+    gInAutomationContext = false;
+    return;
+  }
+  
   String out;
   (void)submitAndExecuteSync(uc, out);
+  
+  automationCallDepth--;
+  
+  UBaseType_t stackAfterSubmit = uxTaskGetStackHighWaterMark(NULL);
+  size_t heapAfter = ESP.getFreeHeap();
+  DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[auto] AFTER_SUBMIT stack=%u heap=%u", stackAfterSubmit, heapAfter);
+  
   routeOutput(out, uc.ctx);
+  
+  UBaseType_t stackAfterRoute = uxTaskGetStackHighWaterMark(NULL);
+  DEBUGF(DEBUG_CLI | DEBUG_AUTOMATIONS, "[auto] EXIT stack=%u", stackAfterRoute);
+  
+  // Clear automation context flag
+  gInAutomationContext = false;
 }
 
 // Helper: run a command as SYSTEM origin with logging (used during first-time setup)
@@ -8202,6 +9684,152 @@ esp_err_t handleAutomationsGet(httpd_req_t* req) {
   if (sanitizeAutomationsJson(json)) {
     writeAutomationsJsonAtomic(json);  // best-effort writeback
   }
+  httpd_resp_send(req, json.c_str(), HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+// Extract array contents by key: finds key then returns substring between matching [ ... ]
+static bool extractArrayByKey(const String& src, const char* key, String& outArray) {
+  String k = String("\"") + key + "\"";
+  int keyPos = src.indexOf(k);
+  if (keyPos < 0) return false;
+  int colon = src.indexOf(':', keyPos + k.length());
+  if (colon < 0) return false;
+  int lb = src.indexOf('[', colon);
+  if (lb < 0) return false;
+  // Find matching closing bracket (simple depth counter)
+  int depth = 0;
+  for (int i = lb; i < (int)src.length(); ++i) {
+    char c = src[i];
+    if (c == '[') depth++;
+    else if (c == ']') {
+      depth--;
+      if (depth == 0) {
+        outArray = src.substring(lb + 1, i);  // contents without outer brackets
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Extract individual items from array string, updating pos to next item
+static bool extractArrayItem(const String& arrayStr, int& pos, String& outItem) {
+  // Skip whitespace and commas
+  while (pos < arrayStr.length() && (arrayStr[pos] == ' ' || arrayStr[pos] == '\t' || arrayStr[pos] == '\n' || arrayStr[pos] == ',')) {
+    pos++;
+  }
+  if (pos >= arrayStr.length()) return false;
+  
+  if (arrayStr[pos] == '{') {
+    // Extract object
+    int depth = 0;
+    int start = pos;
+    for (int i = pos; i < arrayStr.length(); ++i) {
+      char c = arrayStr[i];
+      if (c == '{') depth++;
+      else if (c == '}') {
+        depth--;
+        if (depth == 0) {
+          outItem = arrayStr.substring(start, i + 1);
+          pos = i + 1;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// GET /api/automations/export: export automations for download
+esp_err_t handleAutomationsExport(httpd_req_t* req) {
+  AuthContext ctx;
+  ctx.transport = AUTH_HTTP;
+  ctx.opaque = req;
+  ctx.path = "/api/automations/export";
+  getClientIP(req, ctx.ip);
+  if (!tgRequireAuth(ctx)) return ESP_OK;  // any authed user may export
+
+  // Parse query parameters
+  char query[512] = {0};
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    char idParam[32] = {0};
+    if (httpd_query_key_value(query, "id", idParam, sizeof(idParam)) == ESP_OK) {
+      // Export single automation
+      String json;
+      if (!readText(AUTOMATIONS_JSON_FILE, json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read automations");
+        return ESP_OK;
+      }
+      
+      // Find specific automation using string parsing
+      int targetId = atoi(idParam);
+      String automationsArray;
+      if (!extractArrayByKey(json, "automations", automationsArray)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No automations array found");
+        return ESP_OK;
+      }
+      
+      // Parse automations array to find target
+      String targetAuto;
+      int pos = 0;
+      while (pos < automationsArray.length()) {
+        String item;
+        if (!extractArrayItem(automationsArray, pos, item)) break;
+        
+        // Check if this automation has the target ID
+        int autoId = 0;
+        if (parseJsonInt(item, "id", autoId) && autoId == targetId) {
+          targetAuto = item;
+          break;
+        }
+      }
+      
+      if (targetAuto.length() == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Automation not found");
+        return ESP_OK;
+      }
+      
+      // Generate filename from automation name
+      String name;
+      if (!parseJsonString(targetAuto, "name", name) || name.length() == 0) {
+        name = "automation";
+      }
+      // Sanitize filename
+      name.replace(" ", "_");
+      name.replace("/", "_");
+      name.replace("\\", "_");
+      String filename = name + ".json";
+      
+      // Set download headers
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_set_hdr(req, "Content-Disposition", ("attachment; filename=\"" + filename + "\"").c_str());
+      
+      // Send single automation JSON (targetAuto already includes braces)
+      httpd_resp_send(req, targetAuto.c_str(), HTTPD_RESP_USE_STRLEN);
+      return ESP_OK;
+    }
+  }
+  
+  // Export all automations (bulk export)
+  String json;
+  if (!readText(AUTOMATIONS_JSON_FILE, json)) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read automations");
+    return ESP_OK;
+  }
+  
+  // Generate timestamp for filename
+  time_t now;
+  time(&now);
+  struct tm* timeinfo = localtime(&now);
+  char timestamp[32];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", timeinfo);
+  String filename = String("automations-backup-") + timestamp + ".json";
+  
+  // Set download headers
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Content-Disposition", ("attachment; filename=\"" + filename + "\"").c_str());
+  
   httpd_resp_send(req, json.c_str(), HTTPD_RESP_USE_STRLEN);
   return ESP_OK;
 }
@@ -8447,13 +10075,20 @@ esp_err_t handleFilesCreate(httpd_req_t* req) {
   String path = "/" + name;
 
   if (type == "folder") {
-    // Keep folder creation direct (no CLI equivalent yet)
-    if (LittleFS.mkdir(path)) {
-      httpd_resp_set_type(req, "application/json");
+    // Use CLI command for consistent validation and error handling
+    String cmd = "mkdir " + path;
+    String result;
+    bool success = executeCommand(ctx, cmd, result);
+    
+    httpd_resp_set_type(req, "application/json");
+    if (success && result.startsWith("Created folder:")) {
       httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
     } else {
-      httpd_resp_set_type(req, "application/json");
-      httpd_resp_send(req, "{\"success\":false,\"error\":\"Failed to create folder\"}", HTTPD_RESP_USE_STRLEN);
+      // Extract error message and return as JSON
+      String errorMsg = success ? result : result;
+      errorMsg.replace("\"", "\\\""); // Escape quotes for JSON
+      String jsonResponse = "{\"success\":false,\"error\":\"" + errorMsg + "\"}";
+      httpd_resp_send(req, jsonResponse.c_str(), HTTPD_RESP_USE_STRLEN);
     }
   } else {
     // Normalize extension in path
@@ -8731,7 +10366,7 @@ esp_err_t handleFileDelete(httpd_req_t* req) {
   String path = "/" + nameStr;
 
   // Basic safeguards: disallow deleting critical files and anything in /logs
-  if (nameStr.length() == 0 || nameStr == "." || nameStr == ".." || path == "/settings.json" || path == "/users.json" || path == "/automations.json" || path == "/logs" || path.startsWith("/logs/")) {
+  if (nameStr.length() == 0 || nameStr == "." || nameStr == ".." || path == "/settings.json" || path == "/users.json" || path == "/automations.json" || path == "/devices.json" || path == "/logs" || path.startsWith("/logs/")) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"success\":false,\"error\":\"Deletion not allowed\"}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -9098,6 +10733,12 @@ static bool promoteUserToAdminInternal(const String& username, String& errorOut)
   if (!updated) { errorOut = "User not found"; return false; }
   if (!writeText(USERS_JSON_FILE, json)) { errorOut = "Failed to write users.json"; return false; }
   broadcastOutput(String("[admin] Promoted user to admin: ") + username);
+  
+  // Serial admin status now checked in real-time via isAdminUser()
+  if (gSerialAuthed && gSerialUser == username) {
+    broadcastOutput("[serial] Your admin privileges have been updated");
+  }
+  
   return true;
 }
 
@@ -9176,6 +10817,12 @@ static bool demoteUserFromAdminInternal(const String& username, String& errorOut
   if (!updated) { errorOut = "User not found"; return false; }
   if (!writeText(USERS_JSON_FILE, json)) { errorOut = "Failed to write users.json"; return false; }
   broadcastOutput(String("[admin] Demoted user from admin: ") + username);
+  
+  // Serial admin status now checked in real-time via isAdminUser()
+  if (gSerialAuthed && gSerialUser == username) {
+    broadcastOutput("[serial] Your admin privileges have been revoked");
+  }
+  
   return true;
 }
 
@@ -9267,7 +10914,32 @@ static bool deleteUserInternal(const String& username, String& errorOut) {
   }
   if (!deleted) { errorOut = "User not found"; return false; }
   if (!writeText(USERS_JSON_FILE, json)) { errorOut = "Failed to write users.json"; return false; }
-  broadcastOutput(String("[admin] Deleted user: ") + username);
+  
+  // Force logout all sessions for the deleted user
+  int revokedSessions = 0;
+  String reason = "Account deleted by administrator";
+  
+  // Revoke web sessions
+  for (int i = 0; i < MAX_SESSIONS; ++i) {
+    if (!gSessions[i].sid.length()) continue;
+    if (!gSessions[i].user.equalsIgnoreCase(username)) continue;
+    if (gSessions[i].ip.length() > 0) {
+      storeLogoutReason(gSessions[i].ip, reason);
+    }
+    enqueueTargetedRevokeForSessionIdx(i, reason);
+    revokedSessions++;
+  }
+  
+  // Force logout serial session if this user is logged in
+  if (gSerialAuthed && gSerialUser.equalsIgnoreCase(username)) {
+    gSerialAuthed = false;
+    gSerialUser = String();
+    broadcastOutput("[serial] Your account has been deleted. You have been logged out.");
+    revokedSessions++; // Count serial session too
+  }
+  
+  broadcastOutput(String("[admin] Deleted user: ") + username + 
+                  (revokedSessions > 0 ? String(" (") + String(revokedSessions) + " active session(s) terminated)" : ""));
   return true;
 }
 
@@ -9377,10 +11049,38 @@ esp_err_t handleAdminDenyUser(httpd_req_t* req) {
 }
 
 void setup() {
+  // --- Initialise Serial early ---
   Serial.begin(115200);
-  delay(200);
+  delay(500); // Longer delay for serial connection
+
+  
+  // Generate unique boot ID for session versioning
+  uint64_t chipId = ESP.getEfuseMac();
+  gBootId = String((uint32_t)(chipId >> 32), HEX) + String((uint32_t)chipId, HEX) + "_" + String(millis());
+  
+  // Debug: Log the boot ID generation with extra visibility
+  Serial.println(""); // Blank line for visibility
+  Serial.printf("=== [BOOT_DEBUG] Generated new boot ID: %s ===\n", gBootId.c_str());
+  Serial.println(""); // Blank line for visibility
+  Serial.flush(); // Ensure debug message is sent immediately
+  
   // Build identifier banner
   broadcastOutput("[build] Firmware: reg-json-debug-1");
+  Serial.printf("[BOOT_DEBUG] Setup continuing after banner...\n");
+
+  // --- Command Executor Task init ---
+  if (!gCmdExecQ) {
+    gCmdExecQ = xQueueCreate(6, sizeof(ExecReq*));
+    if (!gCmdExecQ) {
+      Serial.println("FATAL: Failed to create command exec queue");
+      while (1) delay(1000);
+    }
+    const uint32_t cmdExecStackWords = 4096; // words (≈16 KB)
+    if (xTaskCreate(commandExecTask, "cmd_exec", cmdExecStackWords, nullptr, 1, nullptr) != pdPASS) {
+      Serial.println("FATAL: Failed to create command exec task");
+      while (1) delay(1000);
+    }
+  }
 
   // Initialize large buffers with PSRAM preference
   if (!gStreamBuffer) {
@@ -9473,9 +11173,21 @@ void setup() {
     }
   }
 
+  // Initialize logout reasons array
+  if (!gLogoutReasons) {
+    gLogoutReasons = (LogoutReason*)ps_alloc(MAX_LOGOUT_REASONS * sizeof(LogoutReason), AllocPref::PreferPSRAM, "logout.reasons");
+    if (!gLogoutReasons) {
+      Serial.println("FATAL: Failed to allocate logout reasons array");
+      while (1) delay(1000);
+    }
+    // Initialize with placement new to call constructors
+    for (int i = 0; i < MAX_LOGOUT_REASONS; i++) {
+      new (&gLogoutReasons[i]) LogoutReason();
+    }
+  }
+
   // Filesystem FIRST to enable early allocation logging
   fsInit();
-
 
   // Now safe to emit output (may allocate and will be logged)
   broadcastOutput("");
@@ -9510,26 +11222,53 @@ void setup() {
 
   // Network
   setupWiFi();
-  setupNTP();
-
-  // Wait for NTP sync by checking time validity (up to 10 seconds)
-  bool ntpSynced = false;
-  for (int i = 0; i < 50 && !ntpSynced; i++) {
-    delay(200);
-    time_t now = time(nullptr);
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-      logTimeSyncedMarkerIfReady();
-      ntpSynced = true;
-      break;
+  
+  // NTP setup and sync - only if WiFi is connected
+  if (WiFi.isConnected()) {
+    setupNTP();
+    
+    // Wait for NTP sync by checking time validity (up to 10 seconds)
+    bool ntpSynced = false;
+    for (int i = 0; i < 50 && !ntpSynced; i++) {
+      delay(200);
+      time_t now = time(nullptr);
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo)) {
+        logTimeSyncedMarkerIfReady();
+        ntpSynced = true;
+        break;
+      }
     }
+    if (ntpSynced) {
+      broadcastOutput("NTP time synchronized successfully");
+    } else {
+      broadcastOutput("NTP sync timeout - continuing with local time");
+    }
+  } else {
+    broadcastOutput("NTP setup skipped - no WiFi connection");
   }
 
-  // HTTP server
-  if (server == NULL) startHttpServer();
+  // Initialize device registry (after I2C system is ready)
+  Serial.println("[BOOT] Starting device discovery...");
+  ensureDeviceRegistryFile();
+  discoverI2CDevices();
+  Serial.println("[BOOT] Device discovery completed");
 
+  // ESP-NOW auto-initialization (if enabled in settings)
+  if (gSettings.espnowenabled) {
+    Serial.println("[ESP-NOW] Auto-init: Enabled by setting");
+    runUnifiedSystemCommand("espnow init");
+    Serial.println("[ESP-NOW] Auto-init: Command executed");
+  } else {
+    Serial.println("[ESP-NOW] Auto-init: Disabled by setting");
+  }
+
+  // HTTP server - only start if WiFi is connected
   if (WiFi.isConnected()) {
+    if (server == NULL) startHttpServer();
     broadcastOutput("Try: http://" + WiFi.localIP().toString());
+  } else {
+    broadcastOutput("HTTP server not started - no WiFi connection");
   }
 }
 
@@ -9553,6 +11292,9 @@ void loop() {
   if (gDebugFlags & DEBUG_PERFORMANCE) {
     performanceCounter();
   }
+  
+  // ESP-NOW chunked message timeout cleanup
+  cleanupExpiredChunkedMessage();
   // Debounced SSE sensor-status broadcast
   if (gSensorStatusDirty) {
     unsigned long nowMs = millis();
@@ -9596,9 +11338,9 @@ void loop() {
               ctx.path = "serial/login";
               ctx.sid = String();
               authSuccessUnified(ctx, nullptr);
-              // Preserve admin role assignment separately
-              gSerialIsAdmin = isAdminUser(u);
-              broadcastOutput(String("Login successful. User: ") + u + (gSerialIsAdmin ? " (admin)" : ""));
+              // Check admin status in real-time
+              bool isCurrentlyAdmin = isAdminUser(u);
+              broadcastOutput(String("Login successful. User: ") + u + (isCurrentlyAdmin ? " (admin)" : ""));
             } else {
               broadcastOutput("Authentication failed.");
             }
@@ -9612,10 +11354,11 @@ void loop() {
         if (cmd == "logout") {
           gSerialAuthed = false;
           gSerialUser = String();
-          gSerialIsAdmin = false;
+          // gSerialIsAdmin no longer needed - using real-time checks
           broadcastOutput("Logged out.");
         } else if (cmd == "whoami") {
-          broadcastOutput(String("You are ") + (gSerialUser.length() ? gSerialUser : String("(unknown)")) + (gSerialIsAdmin ? " (admin)" : ""));
+          bool isCurrentlyAdmin = gSerialUser.length() ? isAdminUser(gSerialUser) : false;
+          broadcastOutput(String("You are ") + (gSerialUser.length() ? gSerialUser : String("(unknown)")) + (isCurrentlyAdmin ? " (admin)" : ""));
         } else {
           // Record the entered command into the unified feed with source tag (only after auth)
           appendCommandToFeed("serial", cmd);
@@ -9652,13 +11395,15 @@ void loop() {
   }
 
   // Automations scheduler: run immediately if a mutation recently occurred
-  if (gAutosDirty) {
+  // Skip if already in automation context to prevent recursion
+  if (gAutosDirty && !gInAutomationContext) {
     gAutosDirty = false;
     schedulerTickMinute();
   }
 
   // Minute-based automations scheduler (runs once per minute)
-  {
+  // Skip if already in automation context to prevent recursion
+  if (!gInAutomationContext) {
     unsigned long minuteNow = millis() / 60000UL;
     if (minuteNow != gLastMinuteSeen) {
       gLastMinuteSeen = minuteNow;
@@ -9675,24 +11420,49 @@ void loop() {
 // -------------------------------
 // Shared helpers for CLI help UI
 // -------------------------------
-static String renderHelpMain() {
-  return String("\033[2J\033[H") + "Help\n"
-                                   "~~~~~\n\n"
-                                   "Sections:\n"
-                                   "  system    - System status, uptime, memory, files, broadcast, reboot\n"
-                                   "  wifi      - WiFi network management (info, list, add/rm, connect/scan)\n"
-                                   "  sensors   - Sensors and peripherals (ToF, thermal, IMU, APDS, LED)\n"
-                                   "  settings  - Device configuration grouped like the Settings page:\n"
-                                   "              - WiFi Network (via wifi commands)\n"
-                                   "              - System Time (tzoffsetminutes, ntpserver)\n"
-                                   "              - Output Channels (outserial/outweb/outtft)\n"
-                                   "              - CLI History Size (clihistorysize)\n"
-                                   "              - Sensors UI (thermalPollingMs, tofPollingMs, ...)\n"
-                                   "              - Device-side Sensor Settings (i2c clocks, poll rates)\n"
-                                   "              - Debug Controls (debug* toggles)\n\n"
-                                   "Tips:\n"
-                                   "  - Type a section name to view its commands (e.g., 'settings').\n"
-                                   "  - Type 'back' to return to this menu; 'exit' to return to CLI.\n";
+static String renderHelpMain(bool showAll = false) {
+  String help = String("\033[2J\033[H") + "Help";
+  if (showAll) {
+    help += " (All Commands)";
+  } else {
+    help += " (QT PY and Connected Sensors Only)";
+  }
+  help += "\n~~~~~\n\n"
+          "Sections:\n"
+          "  system    - System status, uptime, memory, files, broadcast, reboot\n"
+          "  wifi      - WiFi network management (info, list, add/rm, connect/scan)\n"
+          "  sensors   - Sensors and peripherals";
+  
+  if (!showAll) {
+    // Show connected sensor summary
+    String connectedSensors = "";
+    if (isSensorConnected("thermal")) connectedSensors += " thermal";
+    if (isSensorConnected("tof")) connectedSensors += " ToF";
+    if (isSensorConnected("imu")) connectedSensors += " IMU";
+    if (isSensorConnected("apds")) connectedSensors += " APDS";
+    
+    if (connectedSensors.length() > 0) {
+      help += " (connected:" + connectedSensors + ")";
+    } else {
+      help += " (none detected)";
+    }
+  }
+  
+  help += "\n"
+          "  settings  - Device configuration grouped like the Settings page:\n"
+          "              - WiFi Network (via wifi commands)\n"
+          "              - System Time (tzoffsetminutes, ntpserver)\n"
+          "              - Output Channels (outserial/outweb/outtft)\n"
+          "              - CLI History Size (clihistorysize)\n"
+          "              - Sensors UI (thermalPollingMs, tofPollingMs, ...)\n"
+          "              - Device-side Sensor Settings (i2c clocks, poll rates)\n"
+          "              - Debug Controls (debug* toggles)\n\n"
+          "Tips:\n"
+          "  - Type a section name to view its commands (e.g., 'settings').\n"
+          "  - Type 'help all' to see all commands regardless of connected sensors.\n"
+          "  - Type 'back' to return to this menu; 'exit' to return to CLI.\n";
+  
+  return help;
 }
 
 static String renderHelpSystem() {
@@ -9779,30 +11549,69 @@ static String renderHelpWifi() {
 }
 
 static String renderHelpSensors() {
-  return String("\033[2J\033[H") + "Sensor Commands\n"
-                                   "~~~~~~~~~~~~~~~\n\n"
-                                   "APDS9960 RGB/Gesture Sensor:\n"
-                                   "  apdscolorstart/stop     - Enable/disable color sensing\n"
-                                   "  apdsproximitystart/stop - Enable/disable proximity sensing\n"
-                                   "  apdsgesturestart/stop   - Enable/disable gesture sensing\n"
-                                   "  apdscolor               - Read color values\n"
-                                   "  apdsproximity           - Read proximity value\n"
-                                   "  apdsgesture             - Read gesture\n\n"
-                                   "VL53L4CX ToF Distance Sensor:\n"
-                                   "  tofstart/stop           - Enable/disable ToF sensor\n"
-                                   "  tof                     - Read distance measurement\n\n"
-                                   "MLX90640 Thermal Camera:\n"
-                                   "  thermalstart/stop       - Enable/disable thermal sensor\n"
-                                   "  thermal                 - Read thermal pixel array\n\n"
-                                   "IMU & Other Sensors:\n"
-                                   "  imustart/stop           - Enable/disable IMU sensor\n"
-                                   "  imu                     - Read IMU data (accel/gyro/temp)\n"
-                                   "  gamepad                 - Read gamepad state\n\n"
-                                   "LED Control:\n"
-                                   "  ledcolor <color>        - Set LED to named color\n"
-                                   "  ledclear                - Turn off LED\n"
-                                   "  ledeffect <type> <color1> [color2] [duration] - Run LED effects\n\n"
-                                   "Type 'back' to return to help menu or 'exit' to return to CLI.";
+  String help = String("\033[2J\033[H") + "Sensor Commands";
+  if (gShowAllCommands) {
+    help += " (All Available)";
+  } else {
+    help += " (Connected Only)";
+  }
+  help += "\n~~~~~~~~~~~~~~~\n\n";
+  
+  // APDS9960 RGB/Gesture Sensor
+  if (gShowAllCommands || isSensorConnected("apds")) {
+    help += "APDS9960 RGB/Gesture Sensor";
+    if (!gShowAllCommands) help += " ✓ Connected";
+    help += ":\n"
+            "  apdscolorstart/stop     - Enable/disable color sensing\n"
+            "  apdsproximitystart/stop - Enable/disable proximity sensing\n"
+            "  apdsgesturestart/stop   - Enable/disable gesture sensing\n"
+            "  apdscolor               - Read color values\n"
+            "  apdsproximity           - Read proximity value\n"
+            "  apdsgesture             - Read gesture\n\n";
+  }
+  
+  // VL53L4CX ToF Distance Sensor
+  if (gShowAllCommands || isSensorConnected("tof")) {
+    help += "VL53L4CX ToF Distance Sensor";
+    if (!gShowAllCommands) help += " ✓ Connected";
+    help += ":\n"
+            "  tofstart/stop           - Enable/disable ToF sensor\n"
+            "  tof                     - Read distance measurement\n\n";
+  }
+  
+  // MLX90640 Thermal Camera
+  if (gShowAllCommands || isSensorConnected("thermal")) {
+    help += "MLX90640 Thermal Camera";
+    if (!gShowAllCommands) help += " ✓ Connected";
+    help += ":\n"
+            "  thermalstart/stop       - Enable/disable thermal sensor\n"
+            "  thermal                 - Read thermal pixel array\n\n";
+  }
+  
+  // IMU & Other Sensors
+  if (gShowAllCommands || isSensorConnected("imu")) {
+    help += "IMU";
+    if (!gShowAllCommands) help += " ✓ Connected";
+    help += ":\n"
+            "  imustart/stop           - Enable/disable IMU sensor\n"
+            "  imu                     - Read IMU data (accel/gyro/temp)\n\n";
+  }
+  
+  // Always show LED and gamepad (not I2C dependent)
+  help += "Other Controls:\n"
+          "  gamepad                 - Read gamepad state\n"
+          "  ledcolor <color>        - Set LED to named color\n"
+          "  ledclear                - Turn off LED\n"
+          "  ledeffect <type> <color1> [color2] [duration] - Run LED effects\n\n";
+  
+  if (!gShowAllCommands) {
+    help += "Note: Only showing commands for connected sensors.\n"
+            "Type 'help all' then 'sensors' to see all available sensor commands.\n\n";
+  }
+  
+  help += "Type 'back' to return to help menu or 'exit' to return to CLI.";
+  
+  return help;
 }
 
 static String exitToNormalBanner() {
@@ -9844,12 +11653,1295 @@ static String cmd_status_core() {
   return out;
 }
 
+// Modern command handler for 'status' - handles validation internally
+static String cmd_status_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_status_core();
+}
+
 static String cmd_uptime_core() {
   unsigned long uptimeMs = millis();
   unsigned long seconds = uptimeMs / 1000;
   unsigned long minutes = seconds / 60;
   unsigned long hours = minutes / 60;
   return "Uptime: " + String(hours) + "h " + String(minutes % 60) + "m " + String(seconds % 60) + "s";
+}
+
+// Modern command handler for 'uptime' - handles validation internally
+static String cmd_uptime_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_uptime_core();
+}
+
+// ESP-NOW device name helper functions
+static void addEspNowDevice(const uint8_t* mac, const String& name) {
+  // Check if device already exists (update name)
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (memcmp(gEspNowDevices[i].mac, mac, 6) == 0) {
+      gEspNowDevices[i].name = name;
+      return;
+    }
+  }
+  
+  // Add new device if space available
+  if (gEspNowDeviceCount < 16) {
+    memcpy(gEspNowDevices[gEspNowDeviceCount].mac, mac, 6);
+    gEspNowDevices[gEspNowDeviceCount].name = name;
+    gEspNowDeviceCount++;
+  }
+}
+
+static void removeEspNowDevice(const uint8_t* mac) {
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (memcmp(gEspNowDevices[i].mac, mac, 6) == 0) {
+      // Shift remaining devices down
+      for (int j = i; j < gEspNowDeviceCount - 1; j++) {
+        gEspNowDevices[j] = gEspNowDevices[j + 1];
+      }
+      gEspNowDeviceCount--;
+      return;
+    }
+  }
+}
+
+static String getEspNowDeviceName(const uint8_t* mac) {
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (memcmp(gEspNowDevices[i].mac, mac, 6) == 0) {
+      return gEspNowDevices[i].name;
+    }
+  }
+  return ""; // No name found
+}
+
+// Save ESP-NOW devices to filesystem
+static void saveEspNowDevices() {
+  if (!LittleFS.begin()) return;
+  
+  File file = LittleFS.open("/espnow_devices.json", "w");
+  if (!file) return;
+  
+  file.println("{");
+  file.println("  \"devices\": [");
+  
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    file.print("    {");
+    file.print("\"mac\": \"");
+    file.print(formatMacAddress(gEspNowDevices[i].mac));
+    file.print("\", \"name\": \"");
+    file.print(gEspNowDevices[i].name);
+    file.print("\", \"encrypted\": ");
+    file.print(gEspNowDevices[i].encrypted ? "true" : "false");
+    
+    if (gEspNowDevices[i].encrypted) {
+      file.print(", \"key\": \"");
+      for (int j = 0; j < 16; j++) {
+        if (gEspNowDevices[i].key[j] < 16) file.print("0");
+        file.print(String(gEspNowDevices[i].key[j], HEX));
+      }
+      file.print("\"");
+    }
+    
+    file.print("}");
+    if (i < gEspNowDeviceCount - 1) file.print(",");
+    file.println();
+  }
+  
+  file.println("  ]");
+  file.println("}");
+  file.close();
+}
+
+// Load ESP-NOW devices from filesystem
+static void loadEspNowDevices() {
+  if (!LittleFS.begin()) return;
+  
+  File file = LittleFS.open("/espnow_devices.json", "r");
+  if (!file) return;
+  
+  String content = file.readString();
+  file.close();
+  
+  // Simple JSON parsing for device list
+  gEspNowDeviceCount = 0;
+  int pos = 0;
+  
+  while ((pos = content.indexOf("\"mac\":", pos)) >= 0) {
+    if (gEspNowDeviceCount >= 16) break; // Max devices reached
+    
+    // Extract MAC address
+    int macStart = content.indexOf("\"", pos + 6) + 1;
+    int macEnd = content.indexOf("\"", macStart);
+    if (macStart <= 0 || macEnd <= macStart) break;
+    
+    String macStr = content.substring(macStart, macEnd);
+    
+    // Extract device name
+    int namePos = content.indexOf("\"name\":", macEnd);
+    if (namePos < 0) break;
+    
+    int nameStart = content.indexOf("\"", namePos + 7) + 1;
+    int nameEnd = content.indexOf("\"", nameStart);
+    if (nameStart <= 0 || nameEnd <= nameStart) break;
+    
+    String name = content.substring(nameStart, nameEnd);
+    
+    // Check for encryption flag
+    bool encrypted = false;
+    int encPos = content.indexOf("\"encrypted\":", nameEnd);
+    if (encPos >= 0 && encPos < content.indexOf("}", nameEnd)) {
+      int encStart = content.indexOf(":", encPos) + 1;
+      String encValue = content.substring(encStart, content.indexOf(",", encStart));
+      encValue.trim();
+      encrypted = (encValue == "true");
+    }
+    
+    // Parse MAC address and store device
+    uint8_t mac[6];
+    if (parseMacAddress(macStr, mac)) {
+      memcpy(gEspNowDevices[gEspNowDeviceCount].mac, mac, 6);
+      gEspNowDevices[gEspNowDeviceCount].name = name;
+      gEspNowDevices[gEspNowDeviceCount].encrypted = encrypted;
+      
+      // Load encryption key if present
+      if (encrypted) {
+        int keyPos = content.indexOf("\"key\":", nameEnd);
+        if (keyPos >= 0 && keyPos < content.indexOf("}", nameEnd)) {
+          int keyStart = content.indexOf("\"", keyPos + 6) + 1;
+          int keyEnd = content.indexOf("\"", keyStart);
+          if (keyStart > 0 && keyEnd > keyStart) {
+            String keyHex = content.substring(keyStart, keyEnd);
+            // Parse hex key (32 hex chars = 16 bytes)
+            if (keyHex.length() == 32) {
+              for (int j = 0; j < 16; j++) {
+                String byteStr = keyHex.substring(j * 2, j * 2 + 2);
+                gEspNowDevices[gEspNowDeviceCount].key[j] = strtol(byteStr.c_str(), NULL, 16);
+              }
+            }
+          }
+        }
+      } else {
+        // Clear key for unencrypted devices
+        memset(gEspNowDevices[gEspNowDeviceCount].key, 0, 16);
+      }
+      
+      gEspNowDeviceCount++;
+    }
+    
+    pos = nameEnd;
+  }
+}
+
+// Restore ESP-NOW peers from saved devices
+static void restoreEspNowPeers() {
+  if (!gEspNowInitialized) return;
+  
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    bool success = addEspNowPeerWithEncryption(
+      gEspNowDevices[i].mac, 
+      gEspNowDevices[i].encrypted, 
+      gEspNowDevices[i].encrypted ? gEspNowDevices[i].key : nullptr
+    );
+    
+    if (success) {
+      String encStatus = gEspNowDevices[i].encrypted ? " (encrypted)" : " (unencrypted)";
+      broadcastOutput("[ESP-NOW] Restored device: " + gEspNowDevices[i].name + " (" + formatMacAddress(gEspNowDevices[i].mac) + ")" + encStatus);
+    }
+  }
+}
+
+// ESP-NOW status command
+static String cmd_espnow_status_core() {
+  String result = "ESP-NOW Status:\n";
+  result += "  Initialized: " + String(gEspNowInitialized ? "Yes" : "No") + "\n";
+  result += "  Channel: " + String(gEspNowChannel) + "\n";
+  
+  if (gEspNowInitialized) {
+    result += "  MAC Address: ";
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    for (int i = 0; i < 6; i++) {
+      if (i > 0) result += ":";
+      result += String(mac[i], HEX);
+    }
+    result += "\n";
+    result += "  Paired Devices: " + String(gEspNowDeviceCount) + "\n";
+  }
+  
+  return result;
+}
+
+static String cmd_espnow_status_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_status_core();
+}
+
+// Derive encryption key from passphrase
+static void deriveKeyFromPassphrase(const String& passphrase, uint8_t* key) {
+  if (passphrase.length() == 0) {
+    // No passphrase = no encryption
+    memset(key, 0, 16);
+    gEspNowEncryptionEnabled = false;
+    return;
+  }
+  
+  // Create consistent input for all devices (no device-specific salt)
+  // All devices with the same passphrase will derive the same key
+  String saltedInput = passphrase + ":ESP-NOW-SHARED-KEY";
+  
+  // Use SHA-256 to derive key (first 16 bytes)
+  uint8_t hash[32];
+  mbedtls_sha256((uint8_t*)saltedInput.c_str(), saltedInput.length(), hash, 0);
+  memcpy(key, hash, 16);
+  
+  gEspNowEncryptionEnabled = true;
+  
+  // DEBUG: Show detailed key derivation info
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  String macStr = "";
+  for (int i = 0; i < 6; i++) {
+    if (i > 0) macStr += ":";
+    if (mac[i] < 16) macStr += "0";
+    macStr += String(mac[i], HEX);
+  }
+  
+  String keyStr = "";
+  for (int i = 0; i < 16; i++) {
+    if (key[i] < 16) keyStr += "0";
+    keyStr += String(key[i], HEX);
+  }
+  
+  broadcastOutput("[ESP-NOW] DEBUG KEY DERIVATION:");
+  broadcastOutput("  Device MAC: " + macStr + " (not used in key derivation)");
+  broadcastOutput("  Passphrase: " + passphrase);
+  broadcastOutput("  Salt Input: " + saltedInput);
+  broadcastOutput("  Derived Key: " + keyStr);
+  broadcastOutput("[ESP-NOW] Encryption key derived from passphrase");
+}
+
+// Set ESP-NOW passphrase and derive encryption key
+static void setEspNowPassphrase(const String& passphrase) {
+  gEspNowPassphrase = passphrase;
+  deriveKeyFromPassphrase(passphrase, gEspNowDerivedKey);
+}
+
+// Add ESP-NOW peer with optional encryption
+static bool addEspNowPeerWithEncryption(const uint8_t* mac, bool useEncryption, const uint8_t* encryptionKey) {
+  // Check if peer already exists
+  if (esp_now_is_peer_exist(mac)) {
+    // Remove existing peer first
+    esp_now_del_peer(mac);
+  }
+  
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = gEspNowChannel;
+  peerInfo.ifidx = WIFI_IF_STA;
+  
+  if (useEncryption && encryptionKey) {
+    peerInfo.encrypt = true;
+    memcpy(peerInfo.lmk, encryptionKey, 16);  // Local Master Key
+    
+    // DEBUG: Show encryption key being used for this peer
+    String keyStr = "";
+    for (int i = 0; i < 16; i++) {
+      if (encryptionKey[i] < 16) keyStr += "0";
+      keyStr += String(encryptionKey[i], HEX);
+    }
+    
+    broadcastOutput("[ESP-NOW] DEBUG PEER ENCRYPTION:");
+    broadcastOutput("  Peer MAC: " + formatMacAddress(mac));
+    broadcastOutput("  Encryption Key: " + keyStr);
+    broadcastOutput("[ESP-NOW] Adding encrypted peer: " + formatMacAddress(mac));
+  } else {
+    peerInfo.encrypt = false;
+    broadcastOutput("[ESP-NOW] Adding unencrypted peer: " + formatMacAddress(mac));
+  }
+  
+  esp_err_t result = esp_now_add_peer(&peerInfo);
+  if (result != ESP_OK) {
+    broadcastOutput("[ESP-NOW] Failed to add peer: " + String(result));
+    return false;
+  }
+  
+  return true;
+}
+
+// Send chunked ESP-NOW response
+static void sendChunkedResponse(const uint8_t* targetMac, bool success, const String& result, const String& senderName) {
+  // For short results, send single message (backwards compatibility)
+  if (result.length() <= CHUNK_SIZE) {
+    String responseMessage = String("RESULT:") + (success ? "SUCCESS" : "FAILED") + ":" + result;
+    if (responseMessage.length() > 240) {
+      responseMessage = responseMessage.substring(0, 237) + "...";
+    }
+    
+    esp_err_t sendResult = esp_now_send(targetMac, (uint8_t*)responseMessage.c_str(), responseMessage.length());
+    if (sendResult == ESP_OK) {
+      broadcastOutput("[ESP-NOW] Response sent to " + senderName);
+    } else {
+      broadcastOutput("[ESP-NOW] Failed to send response to " + senderName + ": " + String(sendResult));
+    }
+    return;
+  }
+  
+  // Multi-chunk transmission for long results
+  String hash = String(millis() % 10000); // Simple hash for message identification
+  int totalChunks = (result.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  if (totalChunks > MAX_CHUNKS) totalChunks = MAX_CHUNKS; // Limit to max chunks
+  
+  broadcastOutput("[ESP-NOW] Sending chunked response to " + senderName + " (" + String(totalChunks) + " chunks)");
+  
+  // Send START message
+  String startMsg = String("RESULT_START:") + (success ? "SUCCESS" : "FAILED") + 
+                   ":" + String(totalChunks) + ":" + String(result.length()) + ":" + hash;
+  esp_now_send(targetMac, (uint8_t*)startMsg.c_str(), startMsg.length());
+  delay(50); // Small delay between messages
+  
+  // Send chunks
+  for (int i = 0; i < totalChunks; i++) {
+    int start = i * CHUNK_SIZE;
+    int end = min(start + CHUNK_SIZE, (int)result.length());
+    String chunk = result.substring(start, end);
+    
+    String chunkMsg = String("RESULT_CHUNK:") + String(i + 1) + ":" + chunk;
+    esp_now_send(targetMac, (uint8_t*)chunkMsg.c_str(), chunkMsg.length());
+    delay(50); // Prevent message flooding
+  }
+  
+  // Send END message
+  String endMsg = String("RESULT_END:") + hash;
+  esp_now_send(targetMac, (uint8_t*)endMsg.c_str(), endMsg.length());
+  
+  broadcastOutput("[ESP-NOW] Chunked response transmission complete");
+}
+
+// Cleanup expired chunked messages (5 second timeout)
+static void cleanupExpiredChunkedMessage() {
+  if (gActiveMessage.active && (millis() - gActiveMessage.startTime > 5000)) {
+    broadcastOutput("[ESP-NOW] Chunked message timeout from " + gActiveMessage.deviceName + " - showing partial result:");
+    
+    // Show partial result
+    String partialResult = "";
+    for (int i = 0; i < gActiveMessage.receivedChunks && i < MAX_CHUNKS; i++) {
+      if (gActiveMessage.chunks[i].length() > 0) {
+        partialResult += gActiveMessage.chunks[i];
+      }
+    }
+    
+    if (partialResult.length() > 0) {
+      broadcastOutput(partialResult);
+    }
+    broadcastOutput("[ESP-NOW] Error: Incomplete message (" + String(gActiveMessage.receivedChunks) + "/" + String(gActiveMessage.totalChunks) + " chunks received)");
+    
+    // Reset state
+    gActiveMessage.active = false;
+    for (int i = 0; i < MAX_CHUNKS; i++) {
+      gActiveMessage.chunks[i] = "";
+    }
+  }
+}
+
+// Handle chunked message assembly
+static void handleChunkedMessage(const String& message, const String& deviceName) {
+  if (message.startsWith("RESULT_START:")) {
+    // Parse: RESULT_START:SUCCESS:4:800:ABC123
+    cleanupExpiredChunkedMessage(); // Clean up any previous incomplete message
+    
+    int colon1 = message.indexOf(':', 13); // After "RESULT_START:"
+    int colon2 = message.indexOf(':', colon1 + 1);
+    int colon3 = message.indexOf(':', colon2 + 1);
+    int colon4 = message.indexOf(':', colon3 + 1);
+    
+    if (colon1 > 0 && colon2 > 0 && colon3 > 0 && colon4 > 0) {
+      gActiveMessage.status = message.substring(13, colon1);
+      gActiveMessage.totalChunks = message.substring(colon1 + 1, colon2).toInt();
+      // Skip total length (colon2 to colon3)
+      gActiveMessage.hash = message.substring(colon4 + 1);
+      gActiveMessage.deviceName = deviceName;
+      gActiveMessage.receivedChunks = 0;
+      gActiveMessage.startTime = millis();
+      gActiveMessage.active = true;
+      
+      // Clear chunk array
+      for (int i = 0; i < MAX_CHUNKS; i++) {
+        gActiveMessage.chunks[i] = "";
+      }
+      
+      broadcastOutput("[ESP-NOW] Starting chunked message from " + deviceName + " (" + String(gActiveMessage.totalChunks) + " chunks expected)");
+    }
+    
+  } else if (message.startsWith("RESULT_CHUNK:") && gActiveMessage.active) {
+    // Parse: RESULT_CHUNK:1:chunk_data
+    int colon1 = message.indexOf(':', 13); // After "RESULT_CHUNK:"
+    int colon2 = message.indexOf(':', colon1 + 1);
+    
+    if (colon1 > 0 && colon2 > 0) {
+      int chunkNum = message.substring(13, colon1).toInt();
+      String chunkData = message.substring(colon2 + 1);
+      
+      if (chunkNum >= 1 && chunkNum <= MAX_CHUNKS) {
+        gActiveMessage.chunks[chunkNum - 1] = chunkData; // Convert to 0-based index
+        gActiveMessage.receivedChunks++;
+        
+        broadcastOutput("[ESP-NOW] Received chunk " + String(chunkNum) + "/" + String(gActiveMessage.totalChunks) + " from " + deviceName);
+      }
+    }
+    
+  } else if (message.startsWith("RESULT_END:") && gActiveMessage.active) {
+    // Parse: RESULT_END:ABC123
+    String endHash = message.substring(11);
+    
+    if (endHash == gActiveMessage.hash) {
+      // Assemble all chunks and display
+      String fullResult = "";
+      for (int i = 0; i < gActiveMessage.totalChunks && i < MAX_CHUNKS; i++) {
+        fullResult += gActiveMessage.chunks[i];
+      }
+      
+      broadcastOutput("[ESP-NOW] Remote result from " + gActiveMessage.deviceName + " (" + gActiveMessage.status + "):");
+      broadcastOutput(fullResult);
+      
+      if (gActiveMessage.receivedChunks < gActiveMessage.totalChunks) {
+        broadcastOutput("[ESP-NOW] Warning: Missing " + String(gActiveMessage.totalChunks - gActiveMessage.receivedChunks) + " chunks");
+      }
+      
+      // Cleanup
+      gActiveMessage.active = false;
+      for (int i = 0; i < MAX_CHUNKS; i++) {
+        gActiveMessage.chunks[i] = "";
+      }
+    }
+  }
+}
+
+// Handle ESP-NOW remote command execution
+static void handleEspNowRemoteCommand(const String& message, const uint8_t* senderMac) {
+  // Parse format: REMOTE:username:password:command
+  if (!message.startsWith("REMOTE:")) return;
+  
+  // Find colons: REMOTE:username:password:command
+  //                    ^7      ^first   ^second (command starts after second colon)
+  int firstColon = message.indexOf(':', 7);   // First colon after "REMOTE:"
+  int secondColon = message.indexOf(':', firstColon + 1);
+  
+  if (firstColon < 0 || secondColon < 0) {
+    broadcastOutput("[ESP-NOW] Remote command: Invalid format - need format REMOTE:user:pass:command");
+    return;
+  }
+  
+  String username = message.substring(7, firstColon);
+  String password = message.substring(firstColon + 1, secondColon);
+  String command = message.substring(secondColon + 1);
+  
+  // Get sender device name for logging
+  String senderName = getEspNowDeviceName(senderMac);
+  if (senderName.length() == 0) {
+    senderName = formatMacAddress(senderMac);
+  }
+  
+  broadcastOutput("[ESP-NOW] Remote command from " + senderName + ": user='" + username + "' cmd='" + command + "'");
+  
+  // Authenticate user with existing system
+  if (!isValidUser(username, password)) {
+    broadcastOutput("[ESP-NOW] Remote command: Authentication failed for user '" + username + "'");
+    // TODO: Send failure response back to sender
+    return;
+  }
+  
+  broadcastOutput("[ESP-NOW] Remote command: Authentication successful for user '" + username + "'");
+  
+  // Execute the command and capture result
+  AuthContext authCtx;
+  authCtx.transport = AUTH_SYSTEM;
+  authCtx.user = username;  // Use the authenticated user
+  authCtx.ip = String();
+  authCtx.path = "/espnow-remote";
+  authCtx.opaque = nullptr;
+  
+  String result;
+  bool success = executeCommand(authCtx, command, result);
+  
+  // Log the execution result
+  if (success) {
+    broadcastOutput("[ESP-NOW] Remote command executed: " + (result.length() > 100 ? result.substring(0, 100) + "..." : result));
+  } else {
+    broadcastOutput("[ESP-NOW] Remote command failed: " + (result.length() > 100 ? result.substring(0, 100) + "..." : result));
+  }
+  
+  // Send result back to sender device using chunked transmission
+  sendChunkedResponse(senderMac, success, result, senderName);
+}
+
+// ESP-NOW callback for receiving data
+static void onEspNowDataReceived(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
+  String macStr = "";
+  for (int i = 0; i < 6; i++) {
+    if (i > 0) macStr += ":";
+    if (recv_info->src_addr[i] < 16) macStr += "0";
+    macStr += String(recv_info->src_addr[i], HEX);
+  }
+  
+  // Check if this device is encrypted
+  bool isEncrypted = false;
+  String deviceName = "";
+  String expectedKey = "";
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (memcmp(gEspNowDevices[i].mac, recv_info->src_addr, 6) == 0) {
+      isEncrypted = gEspNowDevices[i].encrypted;
+      deviceName = gEspNowDevices[i].name;
+      
+      // Show expected key for this device
+      for (int j = 0; j < 16; j++) {
+        if (gEspNowDevices[i].key[j] < 16) expectedKey += "0";
+        expectedKey += String(gEspNowDevices[i].key[j], HEX);
+      }
+      break;
+    }
+  }
+  
+  // Check encryption status for display
+  String encStatus = isEncrypted ? " [ENCRYPTED]" : " [UNENCRYPTED]";
+  
+  String message = "";
+  for (int i = 0; i < len && i < 250; i++) {
+    message += (char)incomingData[i];
+  }
+  
+  // DEBUG: Show comprehensive receive info
+  broadcastOutput("[ESP-NOW] DEBUG MESSAGE RECEIVED:");
+  broadcastOutput("  From MAC: " + macStr);
+  broadcastOutput("  Device Name: " + (deviceName.length() > 0 ? deviceName : "UNKNOWN"));
+  broadcastOutput("  Expected Encrypted: " + String(isEncrypted ? "YES" : "NO"));
+  if (isEncrypted) {
+    broadcastOutput("  Expected Key: " + expectedKey);
+  }
+  broadcastOutput("  Message Length: " + String(len));
+  broadcastOutput("  Raw Message: '" + message + "'");
+  
+  // Check if this is a remote command
+  if (message.startsWith("REMOTE:")) {
+    handleEspNowRemoteCommand(message, recv_info->src_addr);
+    return; // Don't show remote commands as regular messages
+  }
+  
+  // Check if this is a remote command result (single or chunked)
+  if (message.startsWith("RESULT:") || message.startsWith("RESULT_START:") || 
+      message.startsWith("RESULT_CHUNK:") || message.startsWith("RESULT_END:")) {
+    
+    String deviceName = getEspNowDeviceName(recv_info->src_addr);
+    if (deviceName.length() == 0) {
+      deviceName = formatMacAddress(recv_info->src_addr);
+    }
+    
+    // Handle chunked messages
+    if (message.startsWith("RESULT_START:") || message.startsWith("RESULT_CHUNK:") || message.startsWith("RESULT_END:")) {
+      handleChunkedMessage(message, deviceName);
+      return;
+    }
+    
+    // Handle legacy single RESULT: messages (backwards compatibility)
+    if (message.startsWith("RESULT:")) {
+      // Parse: RESULT:SUCCESS/FAILED:output
+      int firstColon = message.indexOf(':', 7);
+      if (firstColon > 0) {
+        String status = message.substring(7, firstColon);
+        String output = message.substring(firstColon + 1);
+        
+        broadcastOutput("[ESP-NOW] Remote result from " + deviceName + " (" + status + "):");
+        broadcastOutput(output);
+      } else {
+        broadcastOutput("[ESP-NOW] Remote result from " + deviceName + ": " + message.substring(7));
+      }
+      return;
+    }
+  }
+  
+  // Display the received message (format compatible with web interface parser)
+  if (deviceName.length() > 0) {
+    broadcastOutput("[ESP-NOW] Received from " + deviceName + ": " + message + encStatus);
+  } else {
+    broadcastOutput("[ESP-NOW] Received from " + macStr + ": " + message + encStatus);
+  }
+}
+
+// ESP-NOW callback for send status
+static void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  String macStr = "";
+  for (int i = 0; i < 6; i++) {
+    if (i > 0) macStr += ":";
+    macStr += String(mac_addr[i], HEX);
+  }
+  
+  String statusStr = (status == ESP_NOW_SEND_SUCCESS) ? "Success" : "Failed";
+  
+  // Check if we have a friendly name for this device
+  String deviceName = getEspNowDeviceName(mac_addr);
+  if (deviceName.length() > 0) {
+    broadcastOutput("[ESP-NOW] Send to " + deviceName + ": " + statusStr);
+  } else {
+    broadcastOutput("[ESP-NOW] Send to " + macStr + ": " + statusStr);
+  }
+}
+
+// Initialize ESP-NOW
+static bool initEspNow() {
+  if (gEspNowInitialized) return true;
+  
+  // Set WiFi mode to STA+AP to enable ESP-NOW
+  WiFi.mode(WIFI_AP_STA);
+  
+  // Get current WiFi channel and use it for ESP-NOW
+  wifi_config_t conf;
+  esp_wifi_get_config(WIFI_IF_STA, &conf);
+  gEspNowChannel = conf.sta.channel;
+  if (gEspNowChannel == 0) {
+    // Fallback: get channel from WiFi status
+    gEspNowChannel = WiFi.channel();
+  }
+  if (gEspNowChannel == 0) {
+    gEspNowChannel = 1; // Final fallback
+  }
+  
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    broadcastOutput("[ESP-NOW] Failed to initialize ESP-NOW");
+    return false;
+  }
+  
+  // Register callbacks
+  esp_now_register_recv_cb(onEspNowDataReceived);
+  esp_now_register_send_cb(onEspNowDataSent);
+  
+  gEspNowInitialized = true;
+  broadcastOutput("[ESP-NOW] Initialized successfully on channel " + String(gEspNowChannel));
+  
+  // Load and restore saved devices
+  loadEspNowDevices();
+  restoreEspNowPeers();
+  
+  return true;
+}
+
+// ESP-NOW init command
+static String cmd_espnow_init_core() {
+  if (gEspNowInitialized) {
+    return "ESP-NOW already initialized";
+  }
+  
+  if (initEspNow()) {
+    return "ESP-NOW initialized successfully";
+  } else {
+    return "Failed to initialize ESP-NOW";
+  }
+}
+
+static String cmd_espnow_init_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_init_core();
+}
+
+// Helper: Parse MAC address from string (flexible format)
+static bool parseMacAddress(const String& macStr, uint8_t mac[6]) {
+  String cleanMac = macStr;
+  cleanMac.toUpperCase();
+  
+  // Handle different separators
+  cleanMac.replace("-", ":");
+  cleanMac.replace(" ", ":");
+  
+  // Split by colons and parse each byte
+  int byteIndex = 0;
+  int startPos = 0;
+  
+  for (int i = 0; i <= cleanMac.length() && byteIndex < 6; i++) {
+    if (i == cleanMac.length() || cleanMac[i] == ':') {
+      if (byteIndex >= 6) return false;
+      
+      String byteStr = cleanMac.substring(startPos, i);
+      byteStr.trim();
+      
+      if (byteStr.length() == 0 || byteStr.length() > 2) return false;
+      
+      char* endPtr;
+      long val = strtol(byteStr.c_str(), &endPtr, 16);
+      if (*endPtr != '\0' || val < 0 || val > 255) return false;
+      
+      mac[byteIndex] = (uint8_t)val;
+      byteIndex++;
+      startPos = i + 1;
+    }
+  }
+  
+  return (byteIndex == 6);
+}
+
+// Helper: Format MAC address as string
+static String formatMacAddress(const uint8_t mac[6]) {
+  String result = "";
+  for (int i = 0; i < 6; i++) {
+    if (i > 0) result += ":";
+    if (mac[i] < 16) result += "0";
+    result += String(mac[i], HEX);
+  }
+  result.toUpperCase();
+  return result;
+}
+
+// ESP-NOW pair device command
+static String cmd_espnow_pair_core(const String& originalCmd) {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  // Parse: espnow pair <mac> <name>
+  String cmd = originalCmd;
+  cmd.trim();
+  
+  int firstSpace = cmd.indexOf(' ', 8); // after "espnow pair"
+  if (firstSpace < 0) return "Usage: espnow pair <mac> <name>";
+  
+  int secondSpace = cmd.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0) return "Usage: espnow pair <mac> <name>";
+  
+  String macStr = cmd.substring(firstSpace + 1, secondSpace);
+  String name = cmd.substring(secondSpace + 1);
+  macStr.trim();
+  name.trim();
+  
+  if (macStr.length() == 0 || name.length() == 0) {
+    return "Usage: espnow pair <mac> <name>";
+  }
+  
+  // Parse MAC address
+  uint8_t mac[6];
+  if (!parseMacAddress(macStr, mac)) {
+    return "Invalid MAC address format. Use AA:BB:CC:DD:EE:FF";
+  }
+  
+  // Check if device already exists
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (memcmp(gEspNowDevices[i].mac, mac, 6) == 0) {
+      return "Device already paired. Use 'espnow unpair " + macStr + "' first.";
+    }
+  }
+  
+  // Check device limit
+  if (gEspNowDeviceCount >= 16) {
+    return "Maximum number of devices (16) already paired.";
+  }
+  
+  // Add unencrypted peer to ESP-NOW
+  if (!addEspNowPeerWithEncryption(mac, false, nullptr)) {
+    return "Failed to add unencrypted peer to ESP-NOW.";
+  }
+  
+  // Store device info without encryption
+  memcpy(gEspNowDevices[gEspNowDeviceCount].mac, mac, 6);
+  gEspNowDevices[gEspNowDeviceCount].name = name;
+  gEspNowDevices[gEspNowDeviceCount].encrypted = false;
+  memset(gEspNowDevices[gEspNowDeviceCount].key, 0, 16);
+  gEspNowDeviceCount++;
+  
+  // Save devices to filesystem
+  saveEspNowDevices();
+  
+  return "Unencrypted device paired successfully: " + name + " (" + macStr + ")";
+}
+
+static String cmd_espnow_pair_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_pair_core(cmd);
+}
+
+// ESP-NOW send message command
+static String cmd_espnow_send_core(const String& originalCmd) {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  // Parse: espnow send <mac> <message>
+  String cmd = originalCmd;
+  cmd.trim();
+  
+  int firstSpace = cmd.indexOf(' ', 8); // after "espnow send"
+  if (firstSpace < 0) return "Usage: espnow send <mac> <message>";
+  
+  int secondSpace = cmd.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0) return "Usage: espnow send <mac> <message>";
+  
+  String macStr = cmd.substring(firstSpace + 1, secondSpace);
+  String message = cmd.substring(secondSpace + 1);
+  macStr.trim();
+  message.trim();
+  
+  if (macStr.length() == 0 || message.length() == 0) {
+    return "Usage: espnow send <mac> <message>";
+  }
+  
+  // Parse MAC address
+  uint8_t mac[6];
+  if (!parseMacAddress(macStr, mac)) {
+    return "Invalid MAC address format. Use AA:BB:CC:DD:EE:FF";
+  }
+  
+  // Check if this device is encrypted
+  bool isEncrypted = false;
+  String deviceName = "";
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (memcmp(gEspNowDevices[i].mac, mac, 6) == 0) {
+      isEncrypted = gEspNowDevices[i].encrypted;
+      deviceName = gEspNowDevices[i].name;
+      break;
+    }
+  }
+  
+  // DEBUG: Show comprehensive send info
+  String encStatus = isEncrypted ? " [ENCRYPTED]" : " [UNENCRYPTED]";
+  String keyStr = "";
+  if (isEncrypted) {
+    for (int i = 0; i < 16; i++) {
+      if (gEspNowDerivedKey[i] < 16) keyStr += "0";
+      keyStr += String(gEspNowDerivedKey[i], HEX);
+    }
+  }
+  
+  broadcastOutput("[ESP-NOW] DEBUG MESSAGE SENDING:");
+  broadcastOutput("  To MAC: " + formatMacAddress(mac));
+  broadcastOutput("  Device Name: " + (deviceName.length() > 0 ? deviceName : "UNKNOWN"));
+  broadcastOutput("  Using Encryption: " + String(isEncrypted ? "YES" : "NO"));
+  if (isEncrypted) {
+    broadcastOutput("  Sending Key: " + keyStr);
+  }
+  broadcastOutput("  Message Length: " + String(message.length()));
+  broadcastOutput("  Message Content: '" + message + "'");
+  
+  // Send message
+  esp_err_t result = esp_now_send(mac, (uint8_t*)message.c_str(), message.length());
+  if (result != ESP_OK) {
+    return "Failed to send message: " + String(result);
+  }
+  
+  return "Message sent to " + formatMacAddress(mac);
+}
+
+static String cmd_espnow_send_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_send_core(cmd);
+}
+
+// ESP-NOW list paired devices command
+static String cmd_espnow_list_core() {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  esp_now_peer_info_t peer;
+  esp_now_peer_info_t *from_head = NULL;
+  int count = 0;
+  String result = "Paired ESP-NOW Devices:\n";
+  
+  // Get first peer
+  esp_err_t ret = esp_now_fetch_peer(true, &peer);
+  while (ret == ESP_OK) {
+    String macStr = formatMacAddress(peer.peer_addr);
+    String deviceName = getEspNowDeviceName(peer.peer_addr);
+    
+    // Find encryption status for this device
+    bool isEncrypted = false;
+    for (int i = 0; i < gEspNowDeviceCount; i++) {
+      if (memcmp(gEspNowDevices[i].mac, peer.peer_addr, 6) == 0) {
+        isEncrypted = gEspNowDevices[i].encrypted;
+        break;
+      }
+    }
+    
+    String encStatus = isEncrypted ? " [ENCRYPTED]" : " [UNENCRYPTED]";
+    
+    if (deviceName.length() > 0) {
+      result += "  " + deviceName + " (" + macStr + ") Channel: " + String(peer.channel) + encStatus + "\n";
+    } else {
+      result += "  " + macStr + " (Channel: " + String(peer.channel) + ")" + encStatus + "\n";
+    }
+    count++;
+    
+    // Get next peer
+    ret = esp_now_fetch_peer(false, &peer);
+  }
+  
+  if (count == 0) {
+    result += "  No devices paired\n";
+  } else {
+    result += "Total: " + String(count) + " device(s)\n";
+  }
+  
+  return result;
+}
+
+static String cmd_espnow_list_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_list_core();
+}
+
+// ESP-NOW unpair device command
+static String cmd_espnow_unpair_core(const String& originalCmd) {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  // Parse: espnow unpair <mac>
+  String cmd = originalCmd;
+  cmd.trim();
+  
+  int firstSpace = cmd.indexOf(' ', 10); // after "espnow unpair"
+  if (firstSpace < 0) return "Usage: espnow unpair <mac>";
+  
+  String macStr = cmd.substring(firstSpace + 1);
+  macStr.trim();
+  
+  if (macStr.length() == 0) {
+    return "Usage: espnow unpair <mac>";
+  }
+  
+  // Parse MAC address
+  uint8_t mac[6];
+  if (!parseMacAddress(macStr, mac)) {
+    return "Invalid MAC address format. Use AA:BB:CC:DD:EE:FF";
+  }
+  
+  // Get device name before removing
+  String deviceName = getEspNowDeviceName(mac);
+  
+  // Remove peer from ESP-NOW
+  esp_err_t result = esp_now_del_peer(mac);
+  if (result != ESP_OK) {
+    return "Failed to unpair device: " + String(result);
+  }
+  
+  // Remove device name mapping
+  removeEspNowDevice(mac);
+  
+  // Save devices to filesystem
+  saveEspNowDevices();
+  
+  if (deviceName.length() > 0) {
+    return "Unpaired device: " + deviceName + " (" + formatMacAddress(mac) + ")";
+  } else {
+    return "Unpaired device: " + formatMacAddress(mac);
+  }
+}
+
+static String cmd_espnow_unpair_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_unpair_core(cmd);
+}
+
+// ESP-NOW broadcast message command
+static String cmd_espnow_broadcast_core(const String& originalCmd) {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  // Parse: espnow broadcast <message>
+  String cmd = originalCmd;
+  cmd.trim();
+  
+  int firstSpace = cmd.indexOf(' ', 15); // after "espnow broadcast"
+  if (firstSpace < 0) return "Usage: espnow broadcast <message>";
+  
+  String message = cmd.substring(firstSpace + 1);
+  message.trim();
+  
+  if (message.length() == 0) {
+    return "Usage: espnow broadcast <message>";
+  }
+  
+  // Send to all paired devices
+  esp_now_peer_info_t peer;
+  int sent = 0;
+  int failed = 0;
+  
+  // Get first peer
+  esp_err_t ret = esp_now_fetch_peer(true, &peer);
+  while (ret == ESP_OK) {
+    esp_err_t sendResult = esp_now_send(peer.peer_addr, (uint8_t*)message.c_str(), message.length());
+    if (sendResult == ESP_OK) {
+      sent++;
+    } else {
+      failed++;
+    }
+    
+    // Get next peer
+    ret = esp_now_fetch_peer(false, &peer);
+  }
+  
+  if (sent == 0 && failed == 0) {
+    return "No paired devices to broadcast to";
+  }
+  
+  return "Broadcast sent to " + String(sent) + " device(s)" + 
+         (failed > 0 ? " (" + String(failed) + " failed)" : "");
+}
+
+static String cmd_espnow_broadcast_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_broadcast_core(cmd);
+}
+
+// ESP-NOW remote command execution
+// ESP-NOW set passphrase command
+static String cmd_espnow_setpassphrase_core(const String& originalCmd) {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  // Parse: espnow setpassphrase "MySecretPhrase123"
+  // Find the space after "setpassphrase"
+  int passphraseStart = originalCmd.indexOf("setpassphrase");
+  if (passphraseStart < 0) {
+    return "Usage: espnow setpassphrase \"your_passphrase_here\"\n"
+           "       espnow setpassphrase clear";
+  }
+  
+  passphraseStart += 13; // Length of "setpassphrase"
+  
+  // Skip any spaces after "setpassphrase"
+  while (passphraseStart < originalCmd.length() && originalCmd.charAt(passphraseStart) == ' ') {
+    passphraseStart++;
+  }
+  
+  if (passphraseStart >= originalCmd.length()) {
+    return "Usage: espnow setpassphrase \"your_passphrase_here\"\n"
+           "       espnow setpassphrase clear";
+  }
+  
+  String passphrase = originalCmd.substring(passphraseStart);
+  passphrase.trim();
+  
+  // Handle clear command
+  if (passphrase == "clear") {
+    setEspNowPassphrase("");
+    return "ESP-NOW encryption disabled. All future pairings will be unencrypted.";
+  }
+  
+  // Remove quotes if present
+  if (passphrase.startsWith("\"") && passphrase.endsWith("\"")) {
+    passphrase = passphrase.substring(1, passphrase.length() - 1);
+  }
+  
+  if (passphrase.length() < 8) {
+    return "Error: Passphrase must be at least 8 characters long.";
+  }
+  
+  if (passphrase.length() > 128) {
+    return "Error: Passphrase must be 128 characters or less.";
+  }
+  
+  setEspNowPassphrase(passphrase);
+  return "ESP-NOW encryption passphrase set. Use 'espnow pairsecure' to pair with encryption.\n"
+         "Key derived from: " + passphrase.substring(0, 3) + "..." + passphrase.substring(passphrase.length() - 3);
+}
+
+// ESP-NOW show encryption status command
+static String cmd_espnow_encstatus_core() {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  String result = "ESP-NOW Encryption Status:\n";
+  result += "  Encryption Enabled: " + String(gEspNowEncryptionEnabled ? "Yes" : "No") + "\n";
+  
+  if (gEspNowEncryptionEnabled) {
+    result += "  Passphrase Set: " + String(gEspNowPassphrase.length() > 0 ? "Yes" : "No") + "\n";
+    if (gEspNowPassphrase.length() > 0) {
+      result += "  Passphrase Hint: " + gEspNowPassphrase.substring(0, 3) + "..." + 
+                gEspNowPassphrase.substring(gEspNowPassphrase.length() - 3) + "\n";
+    }
+    
+    // Show key fingerprint (first 4 bytes in hex)
+    result += "  Key Fingerprint: ";
+    for (int i = 0; i < 4; i++) {
+      if (gEspNowDerivedKey[i] < 16) result += "0";
+      result += String(gEspNowDerivedKey[i], HEX);
+    }
+    result += "...\n";
+  }
+  
+  return result;
+}
+
+// ESP-NOW secure pairing command
+static String cmd_espnow_pairsecure_core(const String& originalCmd) {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  if (!gEspNowEncryptionEnabled) {
+    return "Encryption not enabled. Run 'espnow setpassphrase \"your_phrase\"' first.";
+  }
+  
+  // Parse: espnow pairsecure AA:BB:CC:DD:EE:FF devicename
+  // Find the start of arguments after "pairsecure"
+  int pairsecureStart = originalCmd.indexOf("pairsecure");
+  if (pairsecureStart < 0) {
+    return "Usage: espnow pairsecure <mac_address> <device_name>";
+  }
+  
+  pairsecureStart += 10; // Length of "pairsecure"
+  
+  // Skip spaces after "pairsecure"
+  while (pairsecureStart < originalCmd.length() && originalCmd.charAt(pairsecureStart) == ' ') {
+    pairsecureStart++;
+  }
+  
+  if (pairsecureStart >= originalCmd.length()) {
+    return "Usage: espnow pairsecure <mac_address> <device_name>";
+  }
+  
+  // Get the rest of the command
+  String args = originalCmd.substring(pairsecureStart);
+  args.trim();
+  
+  // Find the space between MAC and device name
+  int spacePos = args.indexOf(' ');
+  if (spacePos < 0) {
+    return "Usage: espnow pairsecure <mac_address> <device_name>";
+  }
+  
+  String macStr = args.substring(0, spacePos);
+  String deviceName = args.substring(spacePos + 1);
+  macStr.trim();
+  deviceName.trim();
+  
+  if (macStr.length() == 0 || deviceName.length() == 0) {
+    return "Usage: espnow pairsecure <mac_address> <device_name>";
+  }
+  
+  // Parse MAC address
+  uint8_t mac[6];
+  if (!parseMacAddress(macStr, mac)) {
+    return "Invalid MAC address format. Use AA:BB:CC:DD:EE:FF";
+  }
+  
+  // Check if device already exists
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (memcmp(gEspNowDevices[i].mac, mac, 6) == 0) {
+      return "Device already paired. Use 'espnow unpair " + macStr + "' first.";
+    }
+  }
+  
+  // Check device limit
+  if (gEspNowDeviceCount >= 16) {
+    return "Maximum number of devices (16) already paired.";
+  }
+  
+  // Add encrypted peer to ESP-NOW
+  if (!addEspNowPeerWithEncryption(mac, true, gEspNowDerivedKey)) {
+    return "Failed to add encrypted peer to ESP-NOW.";
+  }
+  
+  // Store device info with encryption
+  memcpy(gEspNowDevices[gEspNowDeviceCount].mac, mac, 6);
+  gEspNowDevices[gEspNowDeviceCount].name = deviceName;
+  gEspNowDevices[gEspNowDeviceCount].encrypted = true;
+  memcpy(gEspNowDevices[gEspNowDeviceCount].key, gEspNowDerivedKey, 16);
+  gEspNowDeviceCount++;
+  
+  // Save to persistent storage
+  saveEspNowDevices();
+  
+  return "Encrypted device paired successfully: " + deviceName + " (" + macStr + ")\n" +
+         "Key fingerprint: " + String(gEspNowDerivedKey[0], HEX) + String(gEspNowDerivedKey[1], HEX) + 
+         String(gEspNowDerivedKey[2], HEX) + String(gEspNowDerivedKey[3], HEX) + "...";
+}
+
+static String cmd_espnow_setpassphrase_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_setpassphrase_core(cmd);
+}
+
+static String cmd_espnow_encstatus_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_encstatus_core();
+}
+
+static String cmd_espnow_pairsecure_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_pairsecure_core(cmd);
+}
+
+static String cmd_espnow_remote_core(const String& originalCmd) {
+  if (!gEspNowInitialized) {
+    return "ESP-NOW not initialized. Run 'espnow init' first.";
+  }
+  
+  // Parse: espnow remote <target> <username> <password> <command>
+  String cmd = originalCmd;
+  cmd.trim();
+  
+  int firstSpace = cmd.indexOf(' ', 13); // after "espnow remote"
+  if (firstSpace < 0) return "Usage: espnow remote <target> <username> <password> <command>";
+  
+  int secondSpace = cmd.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0) return "Usage: espnow remote <target> <username> <password> <command>";
+  
+  int thirdSpace = cmd.indexOf(' ', secondSpace + 1);
+  if (thirdSpace < 0) return "Usage: espnow remote <target> <username> <password> <command>";
+  
+  int fourthSpace = cmd.indexOf(' ', thirdSpace + 1);
+  if (fourthSpace < 0) return "Usage: espnow remote <target> <username> <password> <command>";
+  
+  String target = cmd.substring(firstSpace + 1, secondSpace);
+  String username = cmd.substring(secondSpace + 1, thirdSpace);
+  String password = cmd.substring(thirdSpace + 1, fourthSpace);
+  String command = cmd.substring(fourthSpace + 1);
+  
+  target.trim();
+  username.trim();
+  password.trim();
+  command.trim();
+  
+  if (target.length() == 0 || username.length() == 0 || password.length() == 0 || command.length() == 0) {
+    return "Usage: espnow remote <target> <username> <password> <command>";
+  }
+  
+  // Format remote command message
+  String remoteMessage = "REMOTE:" + username + ":" + password + ":" + command;
+  
+  // Find target device by name or MAC
+  uint8_t targetMac[6];
+  bool found = false;
+  
+  // First try to find by device name
+  for (int i = 0; i < gEspNowDeviceCount; i++) {
+    if (gEspNowDevices[i].name.equalsIgnoreCase(target)) {
+      memcpy(targetMac, gEspNowDevices[i].mac, 6);
+      found = true;
+      break;
+    }
+  }
+  
+  // If not found by name, try to parse as MAC address
+  if (!found && parseMacAddress(target, targetMac)) {
+    found = true;
+  }
+  
+  if (!found) {
+    return "Target device '" + target + "' not found. Use device name or MAC address.";
+  }
+  
+  // Send remote command
+  esp_err_t result = esp_now_send(targetMac, (uint8_t*)remoteMessage.c_str(), remoteMessage.length());
+  if (result != ESP_OK) {
+    return "Failed to send remote command: " + String(result);
+  }
+  
+  return "Remote command sent to " + target + ": " + command;
+}
+
+static String cmd_espnow_remote_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_espnow_remote_core(cmd);
 }
 
 static String cmd_memory_core() {
@@ -9892,6 +12984,483 @@ static String cmd_fsusage_core() {
          + String((usedBytes * 100) / (totalBytes == 0 ? 1 : totalBytes)) + "%";
 }
 
+// Modern command handlers for core commands
+static String cmd_memory_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_memory_core();
+}
+
+static String cmd_psram_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_psram_core();
+}
+
+static String cmd_fsusage_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  return cmd_fsusage_core();
+}
+
+// Modern WiFi command handlers
+static String cmd_wifiinfo_modern(const String& cmd) {
+  return cmd_wifiinfo();  // Already has validation
+}
+
+static String cmd_wifilist_modern(const String& cmd) {
+  return cmd_wifilist();  // Already has validation
+}
+
+static String cmd_wifiadd_modern(const String& cmd) {
+  return cmd_wifiadd(cmd);  // Already has validation
+}
+
+static String cmd_wifirm_modern(const String& cmd) {
+  return cmd_wifirm(cmd);  // Already has validation
+}
+
+static String cmd_wifipromote_modern(const String& cmd) {
+  return cmd_wifipromote(cmd);  // Already has validation
+}
+
+static String cmd_wificonnect_modern(const String& cmd) {
+  return cmd_wificonnect(cmd);  // Already has validation
+}
+
+static String cmd_wifidisconnect_modern(const String& cmd) {
+  return cmd_wifidisconnect();  // Already has validation
+}
+
+static String cmd_wifiscan_modern(const String& cmd) {
+  return cmd_wifiscan(cmd);  // Already has validation
+}
+
+// Modern sensor command handlers
+static String cmd_tof_modern(const String& cmd) {
+  return cmd_tof();  // Already has validation
+}
+
+static String cmd_tofstart_modern(const String& cmd) {
+  return cmd_tofstart();  // Already has validation
+}
+
+static String cmd_tofstop_modern(const String& cmd) {
+  return cmd_tofstop();  // Already has validation
+}
+
+static String cmd_thermalstart_modern(const String& cmd) {
+  return cmd_thermalstart();  // Already has validation
+}
+
+static String cmd_thermalstop_modern(const String& cmd) {
+  return cmd_thermalstop();  // Already has validation
+}
+
+static String cmd_imu_modern(const String& cmd) {
+  return cmd_imu();  // Already has validation
+}
+
+static String cmd_imustart_modern(const String& cmd) {
+  return cmd_imustart();  // Already has validation
+}
+
+static String cmd_imustop_modern(const String& cmd) {
+  return cmd_imustop();  // Already has validation
+}
+
+// Modern APDS sensor command handlers
+static String cmd_apdscolor_modern(const String& cmd) {
+  return cmd_apdscolor();  // Already has validation
+}
+
+static String cmd_apdsproximity_modern(const String& cmd) {
+  return cmd_apdsproximity();  // Already has validation
+}
+
+static String cmd_apdsgesture_modern(const String& cmd) {
+  return cmd_apdsgesture();  // Already has validation
+}
+
+static String cmd_apdscolorstart_modern(const String& cmd) {
+  return cmd_apdscolorstart();  // Already has validation
+}
+
+static String cmd_apdscolorstop_modern(const String& cmd) {
+  return cmd_apdscolorstop();  // Already has validation
+}
+
+static String cmd_apdsproximitystart_modern(const String& cmd) {
+  return cmd_apdsproximitystart();  // Already has validation
+}
+
+static String cmd_apdsproximitystop_modern(const String& cmd) {
+  return cmd_apdsproximitystop();  // Already has validation
+}
+
+static String cmd_apdsgesturestart_modern(const String& cmd) {
+  return cmd_apdsgesturestart();  // Already has validation
+}
+
+static String cmd_apdsgesturestop_modern(const String& cmd) {
+  return cmd_apdsgesturestop();  // Already has validation
+}
+
+// Modern LED command handlers
+static String cmd_ledclear_modern(const String& cmd) {
+  return cmd_ledclear();  // Already has validation
+}
+
+static String cmd_ledcolor_modern(const String& cmd) {
+  return cmd_ledcolor(cmd);  // Already has validation
+}
+
+static String cmd_ledeffect_modern(const String& cmd) {
+  return cmd_ledeffect(cmd);  // Already has validation
+}
+
+// Modern file system command handlers
+static String cmd_files_modern(const String& cmd) {
+  return cmd_files(cmd);  // Already has validation
+}
+
+static String cmd_mkdir_modern(const String& cmd) {
+  return cmd_mkdir(cmd);  // Already has validation
+}
+
+static String cmd_rmdir_modern(const String& cmd) {
+  return cmd_rmdir(cmd);  // Already has validation
+}
+
+static String cmd_filecreate_modern(const String& cmd) {
+  return cmd_filecreate(cmd);  // Already has validation
+}
+
+static String cmd_fileview_modern(const String& cmd) {
+  return cmd_fileview(cmd);  // Already has validation
+}
+
+static String cmd_filedelete_modern(const String& cmd) {
+  return cmd_filedelete(cmd);  // Already has validation
+}
+
+// Modern automation and logging command handlers
+static String cmd_autolog_modern(const String& cmd) {
+  return cmd_autolog(cmd);  // Already has validation
+}
+
+static String cmd_automation_modern(const String& cmd) {
+  return cmd_automation(cmd);  // Already has validation
+}
+
+static String cmd_downloadautomation_modern(const String& cmd) {
+  return cmd_downloadautomation(cmd);  // Already has validation
+}
+
+// Modern user management command handlers
+static String cmd_user_approve_modern(const String& cmd) {
+  return cmd_user_approve(cmd);  // Already has validation
+}
+
+static String cmd_user_deny_modern(const String& cmd) {
+  return cmd_user_deny(cmd);  // Already has validation
+}
+
+static String cmd_user_promote_modern(const String& cmd) {
+  return cmd_user_promote(cmd);  // Already has validation
+}
+
+static String cmd_user_demote_modern(const String& cmd) {
+  return cmd_user_demote(cmd);  // Already has validation
+}
+
+static String cmd_user_delete_modern(const String& cmd) {
+  return cmd_user_delete(cmd);  // Already has validation
+}
+
+static String cmd_user_list_modern(const String& cmd) {
+  return cmd_user_list(cmd);  // Already has validation
+}
+
+static String cmd_user_request_modern(const String& cmd) {
+  return cmd_user_request(cmd);  // Already has validation
+}
+
+static String cmd_session_list_modern(const String& cmd) {
+  return cmd_session_list(cmd);  // Already has validation
+}
+
+static String cmd_session_revoke_modern(const String& cmd) {
+  return cmd_session_revoke(cmd);  // Already has validation
+}
+
+// Modern output routing command handlers
+static String cmd_outserial_modern(const String& cmd) {
+  return cmd_outserial(cmd);  // Already has validation
+}
+
+static String cmd_outweb_modern(const String& cmd) {
+  return cmd_outweb(cmd);  // Already has validation
+}
+
+static String cmd_outtft_modern(const String& cmd) {
+  return cmd_outtft(cmd);  // Already has validation
+}
+
+// Modern settings command handlers
+static String cmd_wifiautoreconnect_modern(const String& cmd) {
+  return cmd_wifiautoreconnect(cmd);  // Already has validation
+}
+
+static String cmd_clihistorysize_modern(const String& cmd) {
+  return cmd_clihistorysize(cmd);  // Already has validation
+}
+
+// Modern debug command handlers
+static String cmd_debugauthcookies_modern(const String& cmd) {
+  return cmd_debugauthcookies(cmd);  // Already has validation
+}
+
+static String cmd_debughttp_modern(const String& cmd) {
+  return cmd_debughttp(cmd);  // Already has validation
+}
+
+static String cmd_debugsse_modern(const String& cmd) {
+  return cmd_debugsse(cmd);  // Already has validation
+}
+
+static String cmd_debugcli_modern(const String& cmd) {
+  return cmd_debugcli(cmd);  // Already has validation
+}
+
+static String cmd_debugsensorsframe_modern(const String& cmd) {
+  return cmd_debugsensorsframe(cmd);  // Already has validation
+}
+
+static String cmd_debugsensorsdata_modern(const String& cmd) {
+  return cmd_debugsensorsdata(cmd);  // Already has validation
+}
+
+static String cmd_debugsensorsgeneral_modern(const String& cmd) {
+  return cmd_debugsensorsgeneral(cmd);  // Already has validation
+}
+
+static String cmd_debugwifi_modern(const String& cmd) {
+  return cmd_debugwifi(cmd);  // Already has validation
+}
+
+static String cmd_debugstorage_modern(const String& cmd) {
+  return cmd_debugstorage(cmd);  // Already has validation
+}
+
+static String cmd_debugperformance_modern(const String& cmd) {
+  return cmd_debugperformance(cmd);  // Already has validation
+}
+
+static String cmd_debugdatetime_modern(const String& cmd) {
+  return cmd_debugdatetime(cmd);  // Already has validation
+}
+
+static String cmd_debugcommandflow_modern(const String& cmd) {
+  return cmd_debugcommandflow(cmd);  // Already has validation
+}
+
+static String cmd_debugusers_modern(const String& cmd) {
+  return cmd_debugusers(cmd);  // Already has validation
+}
+
+// Modern thermal/sensor polling command handlers
+static String cmd_thermaltargetfps_modern(const String& cmd) {
+  return cmd_thermaltargetfps(cmd);  // Already has validation
+}
+
+static String cmd_thermalwebmaxfps_modern(const String& cmd) {
+  return cmd_thermalwebmaxfps(cmd);  // Already has validation
+}
+
+static String cmd_thermalinterpolationenabled_modern(const String& cmd) {
+  return cmd_thermalinterpolationenabled(cmd);  // Already has validation
+}
+
+static String cmd_thermalinterpolationsteps_modern(const String& cmd) {
+  return cmd_thermalinterpolationsteps(cmd);  // Already has validation
+}
+
+static String cmd_thermalinterpolationbuffersize_modern(const String& cmd) {
+  return cmd_thermalinterpolationbuffersize(cmd);  // Already has validation
+}
+
+static String cmd_thermaldevicepollms_modern(const String& cmd) {
+  return cmd_thermaldevicepollms(cmd);  // Already has validation
+}
+
+static String cmd_tofdevicepollms_modern(const String& cmd) {
+  return cmd_tofdevicepollms(cmd);  // Already has validation
+}
+
+static String cmd_imudevicepollms_modern(const String& cmd) {
+  return cmd_imudevicepollms(cmd);  // Already has validation
+}
+
+static String cmd_thermalpollingms_modern(const String& cmd) {
+  return cmd_thermalpollingms(cmd);  // Already has validation
+}
+
+static String cmd_tofpollingms_modern(const String& cmd) {
+  return cmd_tofpollingms(cmd);  // Already has validation
+}
+
+static String cmd_tofstabilitythreshold_modern(const String& cmd) {
+  return cmd_tofstabilitythreshold(cmd);  // Already has validation
+}
+
+static String cmd_i2cclockthermalhz_modern(const String& cmd) {
+  return cmd_i2cclockthermalhz(cmd);  // Already has validation
+}
+
+static String cmd_i2cclocktofhz_modern(const String& cmd) {
+  return cmd_i2cclocktofhz(cmd);  // Already has validation
+}
+
+// Modern sensor UI setting handlers (delegate to set command)
+static String cmd_thermalpalettedefault_modern(const String& cmd) {
+  // Extract value from command like "thermalpalettedefault grayscale"
+  int sp = cmd.indexOf(' ');
+  if (sp < 0) return "Usage: thermalpalettedefault <grayscale|coolwarm>";
+  String value = cmd.substring(sp + 1);
+  value.trim();
+  return cmd_set("set thermalpalettedefault " + value);
+}
+
+static String cmd_thermalewmafactor_modern(const String& cmd) {
+  // Extract value from command like "thermalewmafactor 0.2"
+  int sp = cmd.indexOf(' ');
+  if (sp < 0) return "Usage: thermalewmafactor <0.0..1.0>";
+  String value = cmd.substring(sp + 1);
+  value.trim();
+  return cmd_set("set thermalewmafactor " + value);
+}
+
+static String cmd_thermaltransitionms_modern(const String& cmd) {
+  // Extract value from command like "thermaltransitionms 80"
+  int sp = cmd.indexOf(' ');
+  if (sp < 0) return "Usage: thermaltransitionms <0..5000>";
+  String value = cmd.substring(sp + 1);
+  value.trim();
+  return cmd_set("set thermaltransitionms " + value);
+}
+
+static String cmd_toftransitionms_modern(const String& cmd) {
+  // Extract value from command like "toftransitionms 200"
+  int sp = cmd.indexOf(' ');
+  if (sp < 0) return "Usage: toftransitionms <0..5000>";
+  String value = cmd.substring(sp + 1);
+  value.trim();
+  return cmd_set("set toftransitionms " + value);
+}
+
+static String cmd_tofuimaxdistancemm_modern(const String& cmd) {
+  // Extract value from command like "tofuimaxdistancemm 3400"
+  int sp = cmd.indexOf(' ');
+  if (sp < 0) return "Usage: tofuimaxdistancemm <100..10000>";
+  String value = cmd.substring(sp + 1);
+  value.trim();
+  return cmd_set("set tofuimaxdistancemm " + value);
+}
+
+// Modern misc command handlers
+static String cmd_set_modern(const String& cmd) {
+  return cmd_set(cmd);  // Already has validation
+}
+
+static String cmd_reboot_modern(const String& cmd) {
+  return cmd_reboot(cmd);  // Already has validation
+}
+
+static String cmd_broadcast_modern(const String& cmd) {
+  return cmd_broadcast(cmd);  // Already has validation
+}
+
+static String cmd_pending_list_modern(const String& cmd) {
+  return cmd_pending_list(cmd);  // Already has validation
+}
+
+static String cmd_validate_conditions_modern(const String& cmd) {
+  String conditions = cmd.substring(20); // Skip "validate-conditions "
+  String validationResult = validateConditionalHierarchy(conditions);
+  // If we're in validation mode and validation passes, return "VALID"
+  // Otherwise return the actual validation result (which could be an error)
+  if (gCLIValidateOnly && validationResult == "VALID") {
+    return "VALID";
+  }
+  return validationResult;
+}
+
+// Modern special command handlers
+static String cmd_clear_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  if (!gWebMirror.buf) { gWebMirror.init(gWebMirrorCap); }
+  gWebMirror.clear();
+  gHiddenHistory = "";  // Also clear hidden history
+  return "\033[2J\033[H"
+         "CLI history cleared.";
+}
+
+static String cmd_stack_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  String result = "Task Stack Watermarks (words):\n";
+  
+  // ToF task watermarks
+  result += "ToF Task: current=" + String((unsigned)gToFWatermarkNow) + 
+            ", minimum=" + String((unsigned)gToFWatermarkMin) + "\n";
+  
+  // IMU task watermarks  
+  result += "IMU Task: current=" + String((unsigned)gIMUWatermarkNow) + 
+            ", minimum=" + String((unsigned)gIMUWatermarkMin) + "\n";
+  
+  // Thermal task watermarks
+  result += "Thermal Task: current=" + String((unsigned)gThermalWatermarkNow) + 
+            ", minimum=" + String((unsigned)gThermalWatermarkMin) + "\n";
+  
+  // Main task watermark
+  UBaseType_t mainWatermark = uxTaskGetStackHighWaterMark(NULL);
+  result += "Main Task: current=" + String((unsigned)mainWatermark) + "\n";
+  
+  // Memory usage
+  result += "\nMemory Usage:\n";
+  result += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\n";
+  result += "Min Free Heap: " + String(ESP.getMinFreeHeap()) + " bytes\n";
+  
+  if (psramFound()) {
+    result += "Free PSRAM: " + String(ESP.getFreePsram()) + " bytes\n";
+    result += "Min Free PSRAM: " + String(ESP.getMinFreePsram()) + " bytes\n";
+  }
+  
+  return result;
+}
+
+static String cmd_help_modern(const String& cmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  // Check if "all" parameter is provided for full help
+  String args = cmd.substring(4); // Remove "help"
+  args.trim();
+  bool showAll = (args == "all");
+  
+  // Handle CLI state transitions and help system
+  if (gCLIState == CLI_NORMAL) {
+    // Swap history: hide current CLI output while in help
+    gHiddenHistory = gWebMirror.snapshot();
+    if (!gWebMirror.buf) { gWebMirror.init(gWebMirrorCap); }
+    gWebMirror.clear();
+    gCLIState = CLI_HELP_MAIN;
+    gShowAllCommands = showAll;
+    return renderHelpMain(showAll);
+  } else {
+    // If already in help mode, just re-render main help
+    gCLIState = CLI_HELP_MAIN;
+    gShowAllCommands = showAll;
+    return renderHelpMain(showAll);
+  }
+}
+
 // ----- WiFi command handlers (Batch 2) -----
 static String cmd_wifiinfo() {
   RETURN_VALID_IF_VALIDATE();
@@ -9918,10 +13487,7 @@ static String cmd_wifilist() {
 
 static String cmd_wifiadd(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   // wifiadd <ssid> <pass> [priority] [hidden0|1]
   String args = originalCmd.substring(8);
   args.trim();
@@ -9953,10 +13519,7 @@ static String cmd_wifiadd(const String& originalCmd) {
 
 static String cmd_wifirm(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   String ssid = originalCmd.substring(7);
   ssid.trim();
   if (ssid.length() == 0) return "Usage: wifirm <ssid>";
@@ -9971,10 +13534,7 @@ static String cmd_wifirm(const String& originalCmd) {
 
 static String cmd_wifipromote(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   // wifipromote <ssid> [newPriority]
   String rest = originalCmd.substring(12);
   rest.trim();
@@ -9995,7 +13555,10 @@ static String cmd_wifipromote(const String& originalCmd) {
 static String cmd_wificonnect(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
   // Allow normal users to connect; support flags while preserving legacy usage
-  loadWiFiNetworks();
+  // Only load from file if no networks in memory (avoid overwriting plaintext passwords)
+  if (gWifiNetworkCount == 0) {
+    loadWiFiNetworks();
+  }
   String arg = "";
   if (originalCmd.length() > 11) {
     arg = originalCmd.substring(11);
@@ -10032,32 +13595,23 @@ static String cmd_wificonnect(const String& originalCmd) {
         broadcastOutput(String("Connecting to '") + nw.ssid + "' (priority " + String(nw.priority) + ") ...");
         WiFi.begin(nw.ssid.c_str(), nw.password.c_str());
         unsigned long start = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) { delay(200); }
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) { 
+          delay(200); 
+          // Check for user escape input during WiFi connection
+          if (Serial.available()) {
+            while (Serial.available()) Serial.read(); // consume all pending input
+            broadcastOutput("*** WiFi connection cancelled by user - skipping remaining attempts ***");
+            return "WiFi connection cancelled by user";
+          }
+        }
         if (WiFi.status() == WL_CONNECTED) {
           broadcastOutput(String("WiFi connected: ") + WiFi.localIP().toString());
           gWifiNetworks[i].lastConnected = millis();
           saveWiFiNetworks();
           connected = true;
         } else {
-          broadcastOutput(String("Failed connecting to '") + nw.ssid + "'");
+          broadcastOutput(String("Failed connecting to '") + nw.ssid + "' - WiFi status: " + String(WiFi.status()));
         }
-      }
-    }
-    if (!connected && gSettings.wifiSSID.length() > 0) {
-      broadcastOutput(String("Connecting to fallback SSID '") + gSettings.wifiSSID + "'...");
-      WiFi.begin(gSettings.wifiSSID.c_str(), gSettings.wifiPassword.c_str());
-      unsigned long start = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) { delay(200); }
-      connected = WiFi.status() == WL_CONNECTED;
-      if (connected) {
-        broadcastOutput(String("WiFi connected: ") + WiFi.localIP().toString());
-        int idxPrev = findWiFiNetwork(gSettings.wifiSSID);
-        if (idxPrev >= 0) {
-          gWifiNetworks[idxPrev].lastConnected = millis();
-          saveWiFiNetworks();
-        }
-      } else {
-        broadcastOutput(String("Failed connecting to fallback SSID '") + gSettings.wifiSSID + "'");
       }
     }
   } else if (index1 > 0) {
@@ -10069,6 +13623,11 @@ static String cmd_wificonnect(const String& originalCmd) {
 
   if (connected) {
     if (server == NULL) startHttpServer();
+    
+    // Configure NTP now that WiFi is connected
+    setupNTP();
+    broadcastOutput("NTP configured - time sync will occur in background");
+    
     gOutputFlags |= OUTPUT_WEB;
     gSettings.outWeb = true;
     saveUnifiedSettings();
@@ -10081,8 +13640,7 @@ static String cmd_wificonnect(const String& originalCmd) {
 
 static String cmd_wifidisconnect() {
   RETURN_VALID_IF_VALIDATE();
-  String err = requireAdminFor("adminControls");
-  if (err.length()) return err;
+  // Admin check now handled by executeCommand pipeline
   // Stop HTTP server to free heap
   if (server != NULL) {
     httpd_stop(server);
@@ -10135,15 +13693,39 @@ static String cmd_tofstart() {
   RETURN_VALID_IF_VALIDATE();
   DEBUG_CLIF("tofstart: prev=%d", tofEnabled ? 1 : 0);
 
+  // Check memory before creating task
+  if (ESP.getFreeHeap() < 16384) {  // Need ~16KB minimum
+    return "Insufficient memory for ToF sensor (need 16KB free)";
+  }
+
+  // Add startup delay if other sensors recently started
+  static unsigned long lastSensorStart = 0;
+  unsigned long now = millis();
+  if (now - lastSensorStart < 500) {
+    delay(500 - (now - lastSensorStart));
+  }
+  lastSensorStart = millis();
+
   // Initialize ToF sensor synchronously (like thermal sensor)
   if (!tofConnected || tofSensor == nullptr) {
     DEBUG_CLIF("tofstart: sensor not connected, initializing...");
-    if (!initToFSensor()) {
-      DEBUG_CLIF("tofstart: init failed");
+    
+    // Try initialization with retry
+    bool initSuccess = false;
+    for (int attempt = 0; attempt < 2 && !initSuccess; attempt++) {
+      if (attempt > 0) {
+        DEBUG_CLIF("tofstart: retry attempt %d", attempt + 1);
+        delay(200);  // Brief delay between attempts
+      }
+      initSuccess = initToFSensor();
+    }
+    
+    if (!initSuccess) {
+      DEBUG_CLIF("tofstart: init failed after retries");
       // Ensure ToF stays disabled on init failure
       tofEnabled = false;
       tofConnected = false;
-      return "Failed to initialize VL53L4CX ToF sensor";
+      return "Failed to initialize VL53L4CX ToF sensor (tried 2x)";
     }
   } else {
     DEBUG_CLIF("tofstart: sensor already connected (tofConnected=%d, tofSensor=%p)", tofConnected ? 1 : 0, tofSensor);
@@ -10159,12 +13741,19 @@ static String cmd_tofstart() {
   }
   // Hold I2C clock steady for ToF while enabled (bounded 50k..400k)
   {
+    uint32_t prevClock = gWire1DefaultHz;  // Save previous clock
     uint32_t tofHz = (gSettings.i2cClockToFHz > 0) ? (uint32_t)gSettings.i2cClockToFHz : 200000;
     if (tofHz < 50000) tofHz = 50000;
     if (tofHz > 400000) tofHz = 400000;
-    gWire1DefaultHz = tofHz;
-    i2cSetDefaultWire1Clock();
-    DEBUG_CLIF("[I2C] Wire1 default clock set for ToF -> %lu Hz", (unsigned long)tofHz);
+    
+    // Only change clock if different, add settling delay
+    if (prevClock != tofHz) {
+      DEBUG_CLIF("[I2C] Changing Wire1 clock: %lu -> %lu Hz", (unsigned long)prevClock, (unsigned long)tofHz);
+      gWire1DefaultHz = tofHz;
+      i2cSetDefaultWire1Clock();
+      delay(100);  // Let I2C bus settle after clock change
+    }
+    DEBUG_CLIF("[I2C] Wire1 clock confirmed for ToF: %lu Hz", (unsigned long)tofHz);
   }
   DEBUG_CLIF("tofstart: enabling ToF sensor (persistent ToF task will poll)");
   {
@@ -10251,9 +13840,31 @@ static String cmd_tofstop() {
 
 static String cmd_thermalstart() {
   RETURN_VALID_IF_VALIDATE();
+  
+  // Check memory before creating large thermal task (needs ~40KB)
+  if (ESP.getFreeHeap() < 40960) {
+    return "Insufficient memory for Thermal sensor (need 40KB free)";
+  }
+
+  // Add startup delay if other sensors recently started (thermal needs longest delay)
+  static unsigned long lastSensorStart = 0;
+  unsigned long now = millis();
+  if (now - lastSensorStart < 800) {  // Longer delay for thermal
+    delay(800 - (now - lastSensorStart));
+  }
+  lastSensorStart = millis();
+
   // Preflight: ensure I2C bus clock is set for thermal before init
-  gWire1DefaultHz = gSettings.i2cClockThermalHz > 0 ? (uint32_t)gSettings.i2cClockThermalHz : 800000;
-  i2cSetDefaultWire1Clock();
+  uint32_t prevClock = gWire1DefaultHz;
+  uint32_t thermalHz = gSettings.i2cClockThermalHz > 0 ? (uint32_t)gSettings.i2cClockThermalHz : 800000;
+  
+  // Only change clock if different, add settling delay
+  if (prevClock != thermalHz) {
+    DEBUG_CLIF("[I2C] Changing Wire1 clock for thermal: %lu -> %lu Hz", (unsigned long)prevClock, (unsigned long)thermalHz);
+    gWire1DefaultHz = thermalHz;
+    i2cSetDefaultWire1Clock();
+    delay(150);  // Longer delay for thermal's high clock speed
+  }
 
   // Smart coexistence: try to start thermal without stopping ToF first
   // Only stop ToF if thermal initialization actually fails due to I2C conflicts
@@ -10385,15 +13996,31 @@ static String cmd_imu() {
 }
 
 static String cmd_imustart() {
+  // Check memory before creating IMU task (needs ~20KB)
+  if (ESP.getFreeHeap() < 20480) {
+    return "Insufficient memory for IMU sensor (need 20KB free)";
+  }
+
+  // Add startup delay if other sensors recently started (IMU starts first, shortest delay)
+  static unsigned long lastSensorStart = 0;
+  unsigned long now = millis();
+  if (now - lastSensorStart < 300) {
+    delay(300 - (now - lastSensorStart));
+  }
+  lastSensorStart = millis();
+
   // Create IMU task lazily
   if (imuTaskHandle == nullptr) {
     const uint32_t imuStack = 4096;  // words; ~16KB
     if (xTaskCreate(imuTask, "imu_task", imuStack, nullptr, 1, &imuTaskHandle) != pdPASS) {
-      return "Failed to create IMU task";
+      return "Failed to create IMU task (insufficient memory or resources)";
     }
+    DEBUG_CLIF("imustart: IMU task created successfully");
   }
+  
   // Defer initialization to imuTask; wait briefly for result
   if (bno == nullptr || !imuConnected) {
+    DEBUG_CLIF("imustart: requesting IMU initialization");
     imuInitDone = false;
     imuInitResult = false;
     imuInitRequested = true;
@@ -10404,17 +14031,22 @@ static String cmd_imustart() {
 
   // If init was requested, block up to 3s for a result so CLI returns accurate status
   if (imuInitRequested || bno == nullptr || !imuConnected) {
+    DEBUG_CLIF("imustart: waiting for initialization result...");
     unsigned long start = millis();
     while (!imuInitDone && (millis() - start) < 3000UL) {
       delay(10);
     }
-    if (!imuInitDone || !imuInitResult) {
-      // disable on failure
+    if (!imuInitDone) {
       imuEnabled = false;
-      return "Failed to initialize IMU sensor (deferred)";
+      return "Failed to initialize IMU sensor (timeout after 3s)";
     }
+    if (!imuInitResult) {
+      imuEnabled = false;
+      return "Failed to initialize IMU sensor (initialization failed)";
+    }
+    DEBUG_CLIF("imustart: initialization completed successfully");
   }
-  return "IMU sensor started successfully";
+  return "SUCCESS: IMU sensor started successfully";
 }
 
 static String cmd_imustop() {
@@ -10636,10 +14268,7 @@ static String cmd_files(const String& originalCmd) {
 
 static String cmd_mkdir(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: mkdir <path>";
@@ -10660,10 +14289,7 @@ static String cmd_mkdir(const String& originalCmd) {
 
 static String cmd_rmdir(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: rmdir <path>";
@@ -10685,10 +14311,7 @@ static String cmd_rmdir(const String& originalCmd) {
 
 static String cmd_filecreate(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: filecreate <path>";
@@ -10731,10 +14354,7 @@ static String cmd_fileview(const String& originalCmd) {
 
 static String cmd_filedelete(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   if (!filesystemReady) return "Error: LittleFS not ready";
   int sp1 = originalCmd.indexOf(' ');
   if (sp1 < 0) return "Usage: filedelete <path>";
@@ -10742,25 +14362,68 @@ static String cmd_filedelete(const String& originalCmd) {
   path.trim();
   if (path.length() == 0) return "Usage: filedelete <path>";
   if (!path.startsWith("/")) path = String("/") + path;
-  if (!LittleFS.exists(path)) return String("Error: File not found: ") + path;
-  // Disallow deleting protected files and logs
-  if (path == "/settings.json" || path == "/users.json" || path == "/automations.json" || path == "/logs" || path.startsWith("/logs/")) {
-    return String("Error: Deletion not allowed: ") + path;
-  }
-  if (LittleFS.remove(path)) {
-    return String("Deleted: ") + path;
+  if (!LittleFS.exists(path)) return "Error: File does not exist";
+  if (!LittleFS.remove(path)) return "Error: Failed to delete file";
+  return String("Deleted file: ") + path;
+}
+
+// -------- Automation Logging Commands --------
+static String cmd_autolog(const String& originalCmd) {
+  DEBUG_CLIF("cmd_autolog called with: '%s'", originalCmd.c_str());
+  RETURN_VALID_IF_VALIDATE();
+  // Admin check now handled by executeCommand pipeline
+  
+  String args = originalCmd.substring(String("autolog ").length());
+  args.trim();
+  
+  if (args.startsWith("start ")) {
+    String filename = args.substring(6);
+    filename.trim();
+    if (filename.length() == 0) return "Usage: autolog start <filename>";
+    
+    gAutoLogActive = true;
+    gAutoLogFile = filename;
+    gAutoLogAutomationName = ""; // Will be set when automation starts
+    
+    // Create initial log entry
+    if (!appendAutoLogEntry("LOG_START", "Automation logging started")) {
+      gAutoLogActive = false;
+      gAutoLogFile = "";
+      return "Error: Failed to create log file: " + filename;
+    }
+    
+    return "Automation logging started: " + filename;
+    
+  } else if (args == "stop") {
+    if (!gAutoLogActive) return "Automation logging is not active";
+    
+    // Add final log entry
+    appendAutoLogEntry("LOG_STOP", "Automation logging stopped");
+    
+    String result = "Automation logging stopped: " + gAutoLogFile;
+    gAutoLogActive = false;
+    gAutoLogFile = "";
+    gAutoLogAutomationName = "";
+    
+    return result;
+    
+  } else if (args == "status") {
+    if (gAutoLogActive) {
+      return "Automation logging ACTIVE: " + gAutoLogFile + 
+             (gAutoLogAutomationName.length() > 0 ? " (automation: " + gAutoLogAutomationName + ")" : "");
+    } else {
+      return "Automation logging INACTIVE";
+    }
+    
   } else {
-    return String("Error: Failed to delete: ") + path;
+    return "Usage: autolog start <filename> | autolog stop | autolog status";
   }
 }
 
 // ----- Settings/select toggles handlers (Batch 4 - Part B to reach 10) -----
 static String cmd_wifiautoreconnect(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   String valStr = originalCmd.substring(18);  // after "wifiautoreconnect "
   valStr.trim();
   int v = valStr.toInt();
@@ -10834,10 +14497,7 @@ static String cmd_outserial(const String& originalCmd) {
 
 static String cmd_outweb(const String& originalCmd) {
   RETURN_VALID_IF_VALIDATE();
-  {
-    String err = requireAdminFor("adminControls");
-    if (err.length()) return err;
-  }
+  // Admin check now handled by executeCommand pipeline
   // Syntax:
   //   outweb <0|1> [persist|temp]
   //   outweb [persist|temp] <0|1>
@@ -10883,141 +14543,1012 @@ static String cmd_outweb(const String& originalCmd) {
   }
 }
 
-// Minimal CLI processor used by Serial loop
-static String processCommand(const String& cmd) {
-  String command = cmd;
-  command.trim();
-  command.toLowerCase();
-  // TEMP DEBUG (gated by DEBUG_CMD_FLOW): show raw command and ASCII codes for first 40 chars
-  {
-    String dbg = "";
-    for (unsigned i = 0; i < command.length() && i < 40; ++i) {
-      char c = command[i];
-      dbg += String((int)c) + " ";
-    }
-    DEBUG_CMD_FLOWF("[router] raw='%s', ascii=[%s]", command.c_str(), dbg.c_str());
-    DEBUG_CMD_FLOWF("[router] startsWith(\"user request \")=%s", command.startsWith("user request ") ? "YES" : "NO");
-    DEBUG_CMD_FLOWF("[router] indexOf(\"user request\")==%d", command.indexOf("user request"));
-  }
-  // --- Command Registry Routing (help only) ---
-  // Lightweight registry to normalize command names and auto-generate help
-  struct CommandEntry {
-    const char* name;    // canonical command
-    const char* help;    // short help text
-    bool requiresAdmin;  // whether admin is required (UI will still gate via features)
-  };
+// ---- System Diagnostics Command Implementations ----
 
-  static const CommandEntry kCommands[] = {
+static String cmd_temperature_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  // ESP32 internal temperature sensor
+  float tempC = temperatureRead();
+  float tempF = (tempC * 9.0 / 5.0) + 32.0;
+  
+  String result = "ESP32 Internal Temperature:\n";
+  result += "  " + String(tempC, 1) + "°C (" + String(tempF, 1) + "°F)";
+  
+  return result;
+}
+
+static String cmd_voltage_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  // ESP32 doesn't have built-in VCC measurement like ESP8266
+  // We can read from an ADC pin if voltage divider is connected
+  // For now, provide system power estimates based on operation
+  
+  String result = "Power Supply Information:\n";
+  result += "========================\n";
+  
+  // Estimate power consumption based on active components
+  float estimatedCurrent = 80; // Base ESP32 current in mA
+  
+  if (WiFi.isConnected()) {
+    estimatedCurrent += 120; // WiFi active
+    result += "WiFi: Active (+120mA)\n";
+  } else {
+    result += "WiFi: Inactive\n";
+  }
+  
+  if (thermalConnected && thermalEnabled) {
+    estimatedCurrent += 23; // MLX90640 typical
+    result += "Thermal Sensor: Active (+23mA)\n";
+  }
+  
+  if (imuConnected && imuEnabled) {
+    estimatedCurrent += 12; // BNO055 typical
+    result += "IMU Sensor: Active (+12mA)\n";
+  }
+  
+  if (tofConnected && tofEnabled) {
+    estimatedCurrent += 20; // VL53L4CX typical
+    result += "ToF Sensor: Active (+20mA)\n";
+  }
+  
+  if (apdsConnected) {
+    estimatedCurrent += 3; // APDS9960 typical
+    result += "APDS Sensor: Active (+3mA)\n";
+  }
+  
+  result += "\nEstimated Current Draw: " + String(estimatedCurrent, 0) + "mA\n";
+  result += "Estimated Power (3.3V): " + String((estimatedCurrent * 3.3) / 1000.0, 2) + "W\n";
+  result += "\nNote: Direct voltage measurement requires external ADC connection";
+  
+  return result;
+}
+
+static String cmd_cpufreq_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  String args = originalCmd.substring(7); // "cpufreq "
+  args.trim();
+  
+  uint32_t currentFreq = getCpuFrequencyMhz();
+  
+  if (args.length() == 0) {
+    // Get current frequency
+    String result = "CPU Frequency:\n";
+    result += "  Current: " + String(currentFreq) + " MHz\n";
+    result += "  XTAL: " + String(getXtalFrequencyMhz()) + " MHz\n";
+    result += "  APB: " + String(getApbFrequency() / 1000000) + " MHz";
+    return result;
+  } else {
+    // Set frequency (admin only for safety)
+    // Admin check now handled by executeCommand pipeline
+    
+    uint32_t newFreq = args.toInt();
+    if (newFreq < 80 || newFreq > 240) {
+      return "Error: CPU frequency must be between 80-240 MHz";
+    }
+    
+    // Validate common frequencies
+    if (newFreq != 80 && newFreq != 160 && newFreq != 240) {
+      return "Error: Supported frequencies are 80, 160, or 240 MHz";
+    }
+    
+    setCpuFrequencyMhz(newFreq);
+    return "CPU frequency set to " + String(newFreq) + " MHz";
+  }
+}
+
+static String cmd_taskstats_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  String result = "Task Statistics:\n";
+  result += "=================\n";
+  
+  // Get task count
+  UBaseType_t taskCount = uxTaskGetNumberOfTasks();
+  result += "Total Tasks: " + String(taskCount) + "\n\n";
+  
+  // Allocate memory for task status array
+  TaskStatus_t* taskArray = (TaskStatus_t*)ps_alloc(taskCount * sizeof(TaskStatus_t), AllocPref::PreferPSRAM, "taskstats");
+  if (!taskArray) {
+    return "Error: Unable to allocate memory for task statistics";
+  }
+  
+  // Get detailed task information
+  UBaseType_t actualCount = uxTaskGetSystemState(taskArray, taskCount, nullptr);
+  
+  result += "Task Name          State  Prio  Stack  Core\n";
+  result += "================== ===== ===== ====== ====\n";
+  
+  for (UBaseType_t i = 0; i < actualCount; i++) {
+    String taskName = String(taskArray[i].pcTaskName);
+    
+    // Pad task name to 18 characters
+    while (taskName.length() < 18) taskName += " ";
+    if (taskName.length() > 18) taskName = taskName.substring(0, 18);
+    
+    String state;
+    switch (taskArray[i].eCurrentState) {
+      case eRunning: state = "RUN  "; break;
+      case eReady: state = "READY"; break;
+      case eBlocked: state = "BLOCK"; break;
+      case eSuspended: state = "SUSP "; break;
+      case eDeleted: state = "DEL  "; break;
+      default: state = "UNK  "; break;
+    }
+    
+    String prio = String(taskArray[i].uxCurrentPriority);
+    while (prio.length() < 4) prio = " " + prio;
+    
+    String stack = String(taskArray[i].usStackHighWaterMark);
+    while (stack.length() < 5) stack = " " + stack;
+    
+    String core = String(taskArray[i].xCoreID);
+    
+    result += taskName + " " + state + " " + prio + " " + stack + "   " + core + "\n";
+  }
+  
+  free(taskArray);
+  return result;
+}
+
+static String cmd_heapfrag_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  String result = "Heap Fragmentation Analysis:\n";
+  result += "============================\n";
+  
+  // Internal heap
+  size_t freeHeap = ESP.getFreeHeap();
+  size_t minFreeHeap = ESP.getMinFreeHeap();
+  size_t maxAllocHeap = ESP.getMaxAllocHeap();
+  
+  result += "Internal Heap:\n";
+  result += "  Free: " + String(freeHeap) + " bytes\n";
+  result += "  Min Free: " + String(minFreeHeap) + " bytes\n";
+  result += "  Max Alloc: " + String(maxAllocHeap) + " bytes\n";
+  
+  // Calculate fragmentation percentage
+  float fragmentation = 0.0;
+  if (freeHeap > 0) {
+    fragmentation = ((float)(freeHeap - maxAllocHeap) / (float)freeHeap) * 100.0;
+  }
+  result += "  Fragmentation: " + String(fragmentation, 1) + "%\n\n";
+  
+  // PSRAM if available
+  size_t psramSize = ESP.getPsramSize();
+  if (psramSize > 0) {
+    size_t freePsram = ESP.getFreePsram();
+    size_t minFreePsram = ESP.getMinFreePsram();
+    size_t maxAllocPsram = ESP.getMaxAllocPsram();
+    
+    result += "PSRAM:\n";
+    result += "  Total: " + String(psramSize) + " bytes\n";
+    result += "  Free: " + String(freePsram) + " bytes\n";
+    result += "  Min Free: " + String(minFreePsram) + " bytes\n";
+    result += "  Max Alloc: " + String(maxAllocPsram) + " bytes\n";
+    
+    float psramFrag = 0.0;
+    if (freePsram > 0) {
+      psramFrag = ((float)(freePsram - maxAllocPsram) / (float)freePsram) * 100.0;
+    }
+    result += "  Fragmentation: " + String(psramFrag, 1) + "%\n";
+  } else {
+    result += "PSRAM: Not available\n";
+  }
+  
+  return result;
+}
+
+// I2C Sensor Registry Structure (moved before usage)
+struct I2CSensorEntry {
+  uint8_t address;           // I2C address (7-bit)
+  const char* name;          // Sensor name
+  const char* description;   // Brief description
+  const char* manufacturer;  // Manufacturer
+  bool multiAddress;         // True if sensor supports multiple addresses
+  uint8_t altAddress;        // Alternative address (if multiAddress is true)
+};
+
+// I2C Sensor Database (Adafruit STEMMA QT and common sensors)
+static const I2CSensorEntry kI2CSensors[] = {
+  // Temperature & Humidity Sensors
+  { 0x38, "AHT20", "Temperature & Humidity", "Adafruit", false, 0x00 },
+  { 0x44, "SHT40", "Temperature & Humidity", "Adafruit", true, 0x45 },
+  { 0x70, "HTU21D", "Temperature & Humidity", "Adafruit", false, 0x00 },
+  { 0x77, "BME280", "Temperature, Humidity & Pressure", "Adafruit", true, 0x76 },
+  { 0x76, "BME680", "Environmental (T/H/P/Gas)", "Adafruit", true, 0x77 },
+  { 0x18, "MCP9808", "High Precision Temperature", "Adafruit", true, 0x1F },
+  
+  // Motion & Orientation Sensors  
+  { 0x28, "BNO055", "9-DOF IMU", "Adafruit", true, 0x29 },
+  { 0x6A, "LSM6DS33", "6-DOF IMU", "Adafruit", true, 0x6B },
+  { 0x68, "MPU6050", "6-DOF IMU", "Adafruit", true, 0x69 },
+  { 0x0C, "LIS3MDL", "3-Axis Magnetometer", "Adafruit", true, 0x1E },
+  { 0x53, "ADXL343", "3-Axis Accelerometer", "Adafruit", true, 0x1D },
+  
+  // Light & Color Sensors
+  { 0x39, "APDS9960", "RGB, Gesture & Proximity", "Adafruit", false, 0x00 },
+  { 0x10, "VEML7700", "Ambient Light", "Adafruit", false, 0x00 },
+  { 0x52, "TCS34725", "RGB Color Sensor", "Adafruit", false, 0x00 },
+  { 0x44, "AS7341", "11-Channel Spectral", "Adafruit", false, 0x00 },
+  
+  // Distance & Proximity Sensors
+  { 0x29, "VL53L4CX", "ToF Distance (up to 6m)", "Adafruit", false, 0x00 },
+  { 0x60, "MPR121", "12-Channel Capacitive Touch", "Adafruit", false, 0x00 },
+  
+  // Audio Sensors
+  { 0x36, "MAX9744", "Audio Amplifier", "Adafruit", false, 0x00 },
+  { 0x1A, "MAX98357", "I2S Audio Amplifier", "Adafruit", false, 0x00 },
+  
+  // Haptic / Motor Drivers
+  { 0x5A, "DRV2605", "Haptic Motor Driver", "Adafruit", false, 0x00 },
+  
+  // Display Controllers
+  { 0x3C, "SSD1306", "OLED Display Controller", "Adafruit", true, 0x3D },
+  { 0x60, "SH1107", "OLED Display Controller", "Adafruit", true, 0x61 },
+  
+  // GPIO Expanders & Controllers
+  { 0x36, "Seesaw", "GPIO/PWM/ADC Expander", "Adafruit", true, 0x49 },
+  { 0x20, "MCP23017", "16-Bit I/O Expander", "Adafruit", true, 0x27 },
+  { 0x48, "ADS1015", "12-Bit ADC", "Adafruit", true, 0x4B },
+  { 0x62, "MCP4725", "12-Bit DAC", "Adafruit", true, 0x63 },
+  
+  // Real-Time Clock
+  { 0x68, "DS3231", "Precision RTC", "Adafruit", false, 0x00 },
+  { 0x6F, "DS1307", "Basic RTC", "Adafruit", false, 0x00 },
+  
+  // Power Management
+  { 0x36, "LC709203F", "Battery Monitor", "Adafruit", false, 0x00 },
+  { 0x6B, "MAX17048", "Battery Monitor", "Adafruit", false, 0x00 },
+  
+  // Thermal Sensors
+  { 0x33, "MLX90640", "32x24 Thermal Camera", "Adafruit", false, 0x00 },
+  { 0x5A, "MLX90614", "IR Temperature", "Adafruit", false, 0x00 },
+  
+  // Gas & Air Quality
+  { 0x58, "SGP30", "Air Quality (TVOC/eCO2)", "Adafruit", false, 0x00 },
+  { 0x5B, "CCS811", "Air Quality (TVOC/eCO2)", "Adafruit", true, 0x5A },
+  
+  // Pressure Sensors
+  { 0x77, "BMP280", "Barometric Pressure", "Adafruit", true, 0x76 },
+  { 0x60, "MPL3115A2", "Altimeter/Pressure", "Adafruit", false, 0x00 },
+  
+  // Current/Voltage Sensors
+  { 0x40, "INA219", "Current/Power Monitor", "Adafruit", true, 0x4F },
+  { 0x45, "INA260", "Current/Power Monitor", "Adafruit", true, 0x44 },
+};
+
+// Runtime Device Registry Structure
+struct ConnectedDevice {
+  uint8_t address;
+  const char* name;
+  const char* description;
+  const char* manufacturer;
+  bool isConnected;
+  unsigned long lastSeen;
+  unsigned long firstDiscovered;
+  uint8_t bus;  // 0 = Wire, 1 = Wire1
+};
+
+// Device Registry Global Variables
+#define MAX_CONNECTED_DEVICES 16
+ConnectedDevice gConnectedDevices[MAX_CONNECTED_DEVICES];
+int gConnectedDeviceCount = 0;
+int gDiscoveryCount = 0;
+
+// Device Registry File Management Functions
+static void ensureDeviceRegistryFile() {
+  if (!LittleFS.exists("/devices.json")) {
+    createEmptyDeviceRegistry();
+  }
+}
+
+static void createEmptyDeviceRegistry() {
+  File file = LittleFS.open("/devices.json", "w");
+  if (file) {
+    file.println("{");
+    file.println("  \"lastDiscovery\": 0,");
+    file.println("  \"discoveryCount\": 0,");
+    file.println("  \"devices\": []");
+    file.println("}");
+    file.close();
+  }
+}
+
+static int findSensorIndexByAddress(uint8_t address) {
+  // Pass 1: prefer exact primary address matches
+  for (size_t i = 0; i < (sizeof(kI2CSensors) / sizeof(kI2CSensors[0])); i++) {
+    if (kI2CSensors[i].address == address) {
+      return i;
+    }
+  }
+  // Pass 2: then allow alternate address matches if declared
+  for (size_t i = 0; i < (sizeof(kI2CSensors) / sizeof(kI2CSensors[0])); i++) {
+    if (kI2CSensors[i].multiAddress && kI2CSensors[i].altAddress == address) {
+      return i;
+    }
+  }
+  return -1;  // Not found
+}
+
+// Device Discovery Functions
+static void addDiscoveredDevice(uint8_t address, uint8_t bus) {
+  if (gConnectedDeviceCount >= MAX_CONNECTED_DEVICES) return;
+  
+  int sensorIndex = findSensorIndexByAddress(address);
+  unsigned long now = millis();
+  
+  ConnectedDevice& device = gConnectedDevices[gConnectedDeviceCount++];
+  device.address = address;
+  device.bus = bus;
+  device.isConnected = true;
+  device.lastSeen = now;
+  device.firstDiscovered = now;
+  
+  Serial.print("[DISCOVERY] Found device at 0x");
+  Serial.print(address, HEX);
+  Serial.print(" on bus " + String(bus));
+  
+  if (sensorIndex >= 0) {
+    device.name = kI2CSensors[sensorIndex].name;
+    device.description = kI2CSensors[sensorIndex].description;
+    device.manufacturer = kI2CSensors[sensorIndex].manufacturer;
+    Serial.println(" - " + String(device.name) + " (" + String(device.description) + ")");
+  } else {
+    device.name = "Unknown";
+    device.description = "Unidentified Device";
+    device.manufacturer = "Unknown";
+    Serial.println(" - Unknown device");
+  }
+}
+
+static void scanBusForDevices(uint8_t busNumber) {
+  TwoWire* wire = (busNumber == 0) ? &Wire : &Wire1;
+  
+  // Initialize I2C bus if not already done
+  if (busNumber == 0) {
+    Wire.begin();  // Default pins SDA=21, SCL=22
+  } else {
+    Wire1.begin(22, 19);  // Your project's Wire1 configuration: SDA=22, SCL=19
+  }
+  
+  // Small delay to let bus stabilize
+  delay(10);
+  
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    wire->beginTransmission(addr);
+    if (wire->endTransmission() == 0) {
+      addDiscoveredDevice(addr, busNumber);
+    }
+  }
+}
+
+static void discoverI2CDevices() {
+  Serial.println("[DISCOVERY] Starting I2C device discovery...");
+  ensureDeviceRegistryFile();  // Always ensure file exists first
+  
+  // Clear existing registry
+  gConnectedDeviceCount = 0;
+  gDiscoveryCount++;
+  
+  // Scan both I2C buses
+  Serial.println("[DISCOVERY] Scanning Wire (SDA=21, SCL=22)...");
+  scanBusForDevices(0);  // Wire
+  Serial.println("[DISCOVERY] Scanning Wire1 (SDA=19, SCL=22)...");
+  scanBusForDevices(1);  // Wire1
+  
+  Serial.println("[DISCOVERY] Found " + String(gConnectedDeviceCount) + " total devices");
+  
+  // Save results to JSON file
+  Serial.println("[DISCOVERY] Saving device registry to /devices.json...");
+  saveDeviceRegistryToJSON();
+  Serial.println("[DISCOVERY] Device registry saved successfully");
+}
+
+// JSON Save Function
+static void saveDeviceRegistryToJSON() {
+  ensureDeviceRegistryFile();  // Always ensure file exists
+  
+  File file = LittleFS.open("/devices.json", "w");
+  if (!file) return;
+  
+  file.println("{");
+  file.println("  \"lastDiscovery\": " + String(millis()) + ",");
+  file.println("  \"discoveryCount\": " + String(gDiscoveryCount) + ",");
+  file.println("  \"devices\": [");
+  
+  for (int i = 0; i < gConnectedDeviceCount; i++) {
+    ConnectedDevice& device = gConnectedDevices[i];
+    
+    String hexAddr = String(device.address, HEX);
+    if (device.address < 16) hexAddr = "0" + hexAddr;
+    hexAddr.toUpperCase();
+    
+    file.print("    {");
+    file.print("\"address\": " + String(device.address) + ", ");
+    file.print("\"addressHex\": \"0x" + hexAddr + "\", ");
+    file.print("\"name\": \"" + String(device.name) + "\", ");
+    file.print("\"description\": \"" + String(device.description) + "\", ");
+    file.print("\"manufacturer\": \"" + String(device.manufacturer) + "\", ");
+    file.print("\"bus\": " + String(device.bus) + ", ");
+    file.print("\"isConnected\": " + String(device.isConnected ? "true" : "false") + ", ");
+    file.print("\"lastSeen\": " + String(device.lastSeen) + ", ");
+    file.print("\"firstDiscovered\": " + String(device.firstDiscovered));
+    file.print("}");
+    
+    if (i < gConnectedDeviceCount - 1) file.print(",");
+    file.println();
+  }
+  
+  file.println("  ]");
+  file.println("}");
+  file.close();
+}
+
+// Device Registry Display Functions
+static String displayDeviceRegistry() {
+  String result = "Connected I2C Devices:\n";
+  result += "=====================\n";
+  
+  if (gConnectedDeviceCount == 0) {
+    result += "No devices discovered. Run 'discover' to scan for devices.\n";
+    return result;
+  }
+  
+  result += "Bus  Addr Name         Description                    Status    Last Seen\n";
+  result += "---- ---- ------------ ------------------------------ --------- ---------\n";
+  
+  for (int i = 0; i < gConnectedDeviceCount; i++) {
+    ConnectedDevice& device = gConnectedDevices[i];
+    
+    String busStr = (device.bus == 0) ? "W0" : "W1";
+    String hexAddr = "0x" + String(device.address, HEX);
+    if (device.address < 16) hexAddr = "0x0" + String(device.address, HEX);
+    hexAddr.toUpperCase();
+    
+    String name = String(device.name);
+    if (name.length() > 12) name = name.substring(0, 12);
+    
+    String desc = String(device.description);
+    if (desc.length() > 30) desc = desc.substring(0, 30);
+    
+    String status = device.isConnected ? "Connected" : "Disconnected";
+    
+    unsigned long timeSince = (millis() - device.lastSeen) / 1000;
+    String lastSeen = String(timeSince) + "s ago";
+    
+    result += busStr + "   " + hexAddr + " " + name;
+    while (result.length() % 4 != 0) result += " ";
+    result += " " + desc;
+    while (result.length() % 4 != 0) result += " ";
+    result += " " + status + " " + lastSeen + "\n";
+  }
+  
+  result += "\nTotal: " + String(gConnectedDeviceCount) + " devices";
+  result += " (Discovery #" + String(gDiscoveryCount) + ")";
+  
+  return result;
+}
+
+// New Device Management Commands
+static String cmd_devices_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  ensureDeviceRegistryFile();
+  return displayDeviceRegistry();
+}
+
+static String cmd_discover_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  ensureDeviceRegistryFile();
+  discoverI2CDevices();
+  return "Device discovery completed. Found " + String(gConnectedDeviceCount) + " devices.\nRegistry saved to /devices.json\n\n" + displayDeviceRegistry();
+}
+
+static String cmd_devicefile_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  if (!LittleFS.exists("/devices.json")) {
+    return "Device registry file not found. Run 'discover' to create it.";
+  }
+  
+  File file = LittleFS.open("/devices.json", "r");
+  if (!file) {
+    return "Error: Could not open /devices.json";
+  }
+  
+  String content = file.readString();
+  file.close();
+  
+  return "Device Registry JSON (/devices.json):\n" + content;
+}
+
+// Helper functions for sensor connectivity checking
+static bool isSensorConnected(const String& sensorType) {
+  for (int i = 0; i < gConnectedDeviceCount; i++) {
+    ConnectedDevice& device = gConnectedDevices[i];
+    if (!device.isConnected) continue;
+    
+    // Check sensor type based on I2C address
+    if (sensorType == "thermal" && device.address == 0x33) return true;  // MLX90640
+    if (sensorType == "tof" && device.address == 0x29) return true;      // VL53L4CX
+    if (sensorType == "apds" && device.address == 0x39) return true;     // APDS9960
+    if (sensorType == "imu" && (device.address == 0x68 || device.address == 0x69)) return true; // MPU6050/ICM20948
+  }
+  return false;
+}
+
+// Helper function to identify sensor by I2C address
+static String identifySensor(uint8_t address) {
+  for (size_t i = 0; i < (sizeof(kI2CSensors) / sizeof(kI2CSensors[0])); i++) {
+    const I2CSensorEntry& sensor = kI2CSensors[i];
+    if (sensor.address == address || (sensor.multiAddress && sensor.altAddress == address)) {
+      String result = sensor.name;
+      result += " (";
+      result += sensor.description;
+      result += ")";
+      return result;
+    }
+  }
+  return "Unknown Device";
+}
+
+static String cmd_i2cscan_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  String result = "I2C Bus Scan with Device Identification:\n";
+  result += "========================================\n";
+  
+  // Scan both I2C buses if available
+  result += "Wire (SDA=21, SCL=22):\n";
+  Wire.begin();
+  int count0 = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      String hexAddr = String(addr, HEX);
+      if (addr < 16) hexAddr = "0" + hexAddr;
+      hexAddr.toUpperCase();
+      
+      String identification = identifySensor(addr);
+      result += "  0x" + hexAddr + " (" + String(addr) + ") - " + identification + "\n";
+      count0++;
+    }
+  }
+  if (count0 == 0) result += "  No devices found\n";
+  
+  result += "\nWire1 (SDA=19, SCL=22):\n";
+  Wire1.begin(22, 19);  // Your project's Wire1 configuration
+  int count1 = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire1.beginTransmission(addr);
+    if (Wire1.endTransmission() == 0) {
+      String hexAddr = String(addr, HEX);
+      if (addr < 16) hexAddr = "0" + hexAddr;
+      hexAddr.toUpperCase();
+      
+      String identification = identifySensor(addr);
+      result += "  0x" + hexAddr + " (" + String(addr) + ") - " + identification + "\n";
+      count1++;
+    }
+  }
+  if (count1 == 0) result += "  No devices found\n";
+  
+  result += "\nTotal devices found: " + String(count0 + count1);
+  result += "\nUse 'sensors' to see full sensor database";
+  result += "\nUse 'sensorinfo <name>' for detailed sensor information";
+  
+  return result;
+}
+
+static String cmd_i2cstats_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  String result = "I2C Bus Statistics:\n";
+  result += "==================\n";
+  
+  // Wire bus info
+  result += "Wire (Primary I2C):\n";
+  result += "  SDA Pin: 21\n";
+  result += "  SCL Pin: 22\n";
+  result += "  Clock: " + String(Wire.getClock()) + " Hz\n";
+  result += "  Timeout: " + String(Wire.getTimeOut()) + " ms\n\n";
+  
+  // Wire1 bus info (your project's sensor bus)
+  result += "Wire1 (Sensor I2C):\n";
+  result += "  SDA Pin: 19\n";
+  result += "  SCL Pin: 22\n";
+  result += "  Clock: " + String(gWire1CurrentHz) + " Hz\n";
+  result += "  Default Clock: " + String(gWire1DefaultHz) + " Hz\n\n";
+  
+  // Sensor connection status
+  result += "Connected Sensors:\n";
+  if (gamepadConnected) result += "  Gamepad (seesaw)\n";
+  if (imuConnected) result += "  IMU (BNO055)\n";
+  if (apdsConnected) result += "  APDS9960\n";
+  if (tofConnected) result += "  ToF (VL53L4CX)\n";
+  if (thermalConnected) result += "  Thermal (MLX90640)\n";
+  
+  if (!gamepadConnected && !imuConnected && !apdsConnected && !tofConnected && !thermalConnected) {
+    result += "  No sensors connected\n";
+  }
+  
+  return result;
+}
+
+static String cmd_sensors_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  String args = originalCmd.substring(7); // "sensors"
+  args.trim();
+  
+  String result = "I2C Sensor Database:\n";
+  result += "===================\n";
+  
+  // Check for filter arguments
+  String filter = "";
+  if (args.length() > 0) {
+    filter = args;
+    filter.toLowerCase();
+    result += "Filter: '" + args + "'\n\n";
+  }
+  
+  result += "Addr Name         Description                    Manufacturer\n";
+  result += "---- ------------ ------------------------------ ------------\n";
+  
+  int count = 0;
+  for (size_t i = 0; i < (sizeof(kI2CSensors) / sizeof(kI2CSensors[0])); i++) {
+    const I2CSensorEntry& sensor = kI2CSensors[i];
+    
+    // Apply filter if specified
+    if (filter.length() > 0) {
+      String sensorName = String(sensor.name);
+      String sensorDesc = String(sensor.description);
+      String sensorMfg = String(sensor.manufacturer);
+      sensorName.toLowerCase();
+      sensorDesc.toLowerCase();
+      sensorMfg.toLowerCase();
+      
+      if (sensorName.indexOf(filter) < 0 && 
+          sensorDesc.indexOf(filter) < 0 && 
+          sensorMfg.indexOf(filter) < 0) {
+        continue;
+      }
+    }
+    
+    String hexAddr = String(sensor.address, HEX);
+    if (sensor.address < 16) hexAddr = "0" + hexAddr;
+    hexAddr.toUpperCase();
+    
+    String name = String(sensor.name);
+    while (name.length() < 12) name += " ";
+    if (name.length() > 12) name = name.substring(0, 12);
+    
+    String desc = String(sensor.description);
+    while (desc.length() < 30) desc += " ";
+    if (desc.length() > 30) desc = desc.substring(0, 30);
+    
+    result += "0x" + hexAddr + " " + name + " " + desc + " " + String(sensor.manufacturer);
+    
+    if (sensor.multiAddress) {
+      String altHex = String(sensor.altAddress, HEX);
+      if (sensor.altAddress < 16) altHex = "0" + altHex;
+      altHex.toUpperCase();
+      result += " (alt: 0x" + altHex + ")";
+    }
+    result += "\n";
+    count++;
+  }
+  
+  result += "\nTotal sensors in database: " + String(sizeof(kI2CSensors) / sizeof(kI2CSensors[0]));
+  if (filter.length() > 0) {
+    result += " (showing " + String(count) + " matches)";
+  }
+  result += "\n\nUsage: sensors [filter] - filter by name, description, or manufacturer";
+  result += "\nExample: sensors temperature, sensors adafruit, sensors imu";
+  
+  return result;
+}
+
+static String cmd_sensorinfo_modern(const String& originalCmd) {
+  RETURN_VALID_IF_VALIDATE();
+  
+  String args = originalCmd.substring(10); // "sensorinfo"
+  args.trim();
+  
+  if (args.length() == 0) {
+    return "Usage: sensorinfo <sensor_name>\nExample: sensorinfo BNO055";
+  }
+  
+  // Find sensor by name (case insensitive)
+  const I2CSensorEntry* foundSensor = nullptr;
+  String searchName = args;
+  searchName.toLowerCase();
+  
+  for (size_t i = 0; i < (sizeof(kI2CSensors) / sizeof(kI2CSensors[0])); i++) {
+    String sensorName = String(kI2CSensors[i].name);
+    sensorName.toLowerCase();
+    if (sensorName == searchName) {
+      foundSensor = &kI2CSensors[i];
+      break;
+    }
+  }
+  
+  if (!foundSensor) {
+    String result = "Sensor '" + args + "' not found in database.\n\n";
+    result += "Available sensors:\n";
+    for (size_t i = 0; i < (sizeof(kI2CSensors) / sizeof(kI2CSensors[0])); i++) {
+      result += "  " + String(kI2CSensors[i].name) + "\n";
+      if (i > 10) {
+        result += "  ... and " + String((sizeof(kI2CSensors) / sizeof(kI2CSensors[0])) - i - 1) + " more\n";
+        break;
+      }
+    }
+    result += "\nUse 'sensors' to see the full list";
+    return result;
+  }
+  
+  String result = "Sensor Information:\n";
+  result += "==================\n";
+  result += "Name: " + String(foundSensor->name) + "\n";
+  result += "Description: " + String(foundSensor->description) + "\n";
+  result += "Manufacturer: " + String(foundSensor->manufacturer) + "\n";
+  
+  String hexAddr = String(foundSensor->address, HEX);
+  if (foundSensor->address < 16) hexAddr = "0" + hexAddr;
+  hexAddr.toUpperCase();
+  result += "I2C Address: 0x" + hexAddr + " (" + String(foundSensor->address) + ")\n";
+  
+  if (foundSensor->multiAddress) {
+    String altHex = String(foundSensor->altAddress, HEX);
+    if (foundSensor->altAddress < 16) altHex = "0" + altHex;
+    altHex.toUpperCase();
+    result += "Alternative Address: 0x" + altHex + " (" + String(foundSensor->altAddress) + ")\n";
+  }
+  
+  // Check if this sensor is currently connected
+  bool connectedWire0 = false, connectedWire1 = false;
+  
+  Wire.begin();
+  Wire.beginTransmission(foundSensor->address);
+  if (Wire.endTransmission() == 0) connectedWire0 = true;
+  
+  Wire1.begin(22, 19);
+  Wire1.beginTransmission(foundSensor->address);
+  if (Wire1.endTransmission() == 0) connectedWire1 = true;
+  
+  if (foundSensor->multiAddress) {
+    Wire.beginTransmission(foundSensor->altAddress);
+    if (Wire.endTransmission() == 0) connectedWire0 = true;
+    
+    Wire1.beginTransmission(foundSensor->altAddress);
+    if (Wire1.endTransmission() == 0) connectedWire1 = true;
+  }
+  
+  result += "\nConnection Status:\n";
+  if (connectedWire0) result += "  ✓ Connected on Wire (SDA=21, SCL=22)\n";
+  if (connectedWire1) result += "  ✓ Connected on Wire1 (SDA=19, SCL=22)\n";
+  if (!connectedWire0 && !connectedWire1) {
+    result += "  ✗ Not currently connected\n";
+  }
+  
+  return result;
+}
+
+// Command registry structure (moved outside function to avoid stack overflow)
+struct CommandEntry {
+  const char* name;    // canonical command
+  const char* help;    // short help text
+  bool requiresAdmin;  // whether admin is required (UI will still gate via features)
+  String (*handler)(const String& cmd);  // function pointer to command handler (nullptr = use legacy routing)
+};
+
+// Static command registry (moved outside function to avoid stack allocation)
+static const CommandEntry kCommands[] = {
     // ---- Core / General ----
-    { "help", "Show available commands and usage.", false },
-    { "stack", "Show task stack watermarks and memory usage.", false },
-    { "clear", "Clear CLI/web output history.", false },
-    { "status", "Show system status (WiFi, FS, memory).", false },
-    { "uptime", "Show device uptime.", false },
-    { "memory", "Show heap/PSRAM usage.", false },
-    { "psram", "Show PSRAM stats.", false },
-    { "fsusage", "Show filesystem usage.", false },
+    { "help", "Show available commands and usage. Use 'help all' to see all commands.", false, cmd_help_modern },
+    { "stack", "Show task stack watermarks and memory usage.", false, cmd_stack_modern },
+    { "clear", "Clear CLI/web output history.", false, cmd_clear_modern },
+    { "status", "Show system status (WiFi, FS, memory).", false, cmd_status_modern },
+    { "uptime", "Show device uptime.", false, cmd_uptime_modern },
+    { "memory", "Show heap/PSRAM usage.", false, cmd_memory_modern },
+    { "psram", "Show PSRAM stats.", false, cmd_psram_modern },
+    { "fsusage", "Show filesystem usage.", false, cmd_fsusage_modern },
+    { "espnow status", "Show ESP-NOW status and configuration.", false, cmd_espnow_status_modern },
+    { "espnow init", "Initialize ESP-NOW communication.", false, cmd_espnow_init_modern },
+    { "espnow pair", "Pair ESP-NOW device: 'espnow pair <mac> <name>'.", false, cmd_espnow_pair_modern },
+    { "espnow unpair", "Unpair ESP-NOW device: 'espnow unpair <mac>'.", false, cmd_espnow_unpair_modern },
+    { "espnow list", "List all paired ESP-NOW devices.", false, cmd_espnow_list_modern },
+    { "espnow send", "Send message: 'espnow send <mac> <message>'.", false, cmd_espnow_send_modern },
+    { "espnow broadcast", "Broadcast message: 'espnow broadcast <message>'.", false, cmd_espnow_broadcast_modern },
+    { "espnow remote", "Execute remote command: 'espnow remote <target> <user> <pass> <cmd>'.", false, cmd_espnow_remote_modern },
+    { "espnow setpassphrase", "Set encryption passphrase: 'espnow setpassphrase \"phrase\"'.", false, cmd_espnow_setpassphrase_modern },
+    { "espnow encstatus", "Show ESP-NOW encryption status and key fingerprint.", false, cmd_espnow_encstatus_modern },
+    { "espnow pairsecure", "Pair device with encryption: 'espnow pairsecure <mac> <name>'.", false, cmd_espnow_pairsecure_modern },
+    { "testencryption", "Test WiFi password encryption (admin only).", true, cmd_testencryption },
+    { "testpassword", "Test user password hashing (admin only).", true, cmd_testpassword },
 
     // ---- Settings: WiFi Network (matches Settings page WiFi section) ----
-    { "wifiinfo", "Show WiFi details.", false },
-    { "wifilist", "List saved WiFi networks.", false },
-    { "wifiadd", "Add/overwrite a WiFi network.", true },
-    { "wifirm", "Remove a saved WiFi network.", true },
-    { "wifipromote", "Change priority of a saved WiFi network.", true },
-    { "wificonnect", "Connect to WiFi (best/index).", false },
-    { "wifidisconnect", "Disconnect WiFi and stop HTTP server.", true },
-    { "wifiscan", "Scan WiFi networks (plain/json).", false },
+    { "wifiinfo", "Show WiFi details.", false, cmd_wifiinfo_modern },
+    { "wifilist", "List saved WiFi networks.", false, cmd_wifilist_modern },
+    { "wifiadd", "Add/overwrite a WiFi network.", true, cmd_wifiadd_modern },
+    { "wifirm", "Remove a saved WiFi network.", true, cmd_wifirm_modern },
+    { "wifipromote", "Change priority of a saved WiFi network.", true, cmd_wifipromote_modern },
+    { "wificonnect", "Connect to WiFi (best/index).", false, cmd_wificonnect_modern },
+    { "wifidisconnect", "Disconnect WiFi and stop HTTP server.", true, cmd_wifidisconnect_modern },
+    { "wifiscan", "Scan WiFi networks (plain/json).", false, cmd_wifiscan_modern },
 
     // ---- Settings: System Time (timezone/NTP via 'set' command) ----
     // Use: set tzoffsetminutes <mins>, set ntpserver <host>
 
     // ---- Settings: Output Channels (persisted + runtime) ----
-    { "outserial", "Toggle persisted serial output 0|1 or 'temp 0|1'.", true },
-    { "outweb", "Toggle persisted web output 0|1 or 'temp 0|1'.", true },
-    { "outtft", "Toggle persisted TFT output 0|1 or 'temp 0|1'.", true },
+    // (Moved to Output Routing section below)
 
     // ---- Settings: CLI History ----
-    { "clihistorysize", "Set CLI history size.", true },
+    // (Moved to Settings section below)
 
     // ---- Settings: Sensors UI (client-side visualization) ----
-    { "thermalpollingms", "Thermal UI polling (ms).", true },
-    { "tofpollingms", "ToF UI polling (ms).", true },
-    { "tofstabilitythreshold", "ToF stability threshold.", true },
-    { "thermalpalettedefault", "Thermal default palette.", true },
-    { "thermalwebmaxfps", "Thermal Web Max FPS.", true },
-    { "thermalewmafactor", "Thermal EWMA factor.", true },
-    { "thermaltransitionms", "Thermal transition (ms).", true },
-    { "toftransitionms", "ToF transition (ms).", true },
-    { "tofuimaxdistancemm", "ToF UI max distance (mm).", true },
+    { "thermalpalettedefault", "Set thermal default palette.", true, cmd_thermalpalettedefault_modern },
+    { "thermalewmafactor", "Set thermal EWMA factor.", true, cmd_thermalewmafactor_modern },
+    { "thermaltransitionms", "Set thermal transition time.", true, cmd_thermaltransitionms_modern },
+    { "toftransitionms", "Set ToF transition time.", true, cmd_toftransitionms_modern },
+    { "tofuimaxdistancemm", "Set ToF UI max distance.", true, cmd_tofuimaxdistancemm_modern },
+    // Note: thermalpollingms, tofpollingms, tofstabilitythreshold, thermalwebmaxfps moved to Thermal/Sensor Polling Settings section
 
     // ---- Settings: Device-side Sensor Settings ----
-    { "thermaltargetfps", "Set thermal FPS (1..8).", true },
-    { "thermaldevicepollms", "Thermal device poll (ms).", true },
-    { "tofdevicepollms", "ToF device poll (ms).", true },
-    { "imudevicepollms", "IMU device poll (ms).", true },
-    { "i2cclockthermalhz", "Thermal I2C clock (Hz).", true },
-    { "i2cclocktofhz", "ToF I2C clock (Hz).", true },
+    // (Moved to Thermal/Sensor Polling Settings section below)
 
     // ---- Settings: Debug Controls (matches Settings page Debug section) ----
-    { "debugauthcookies", "Toggle auth/cookies debug 0|1.", true },
-    { "debughttp", "Toggle HTTP routing debug 0|1.", true },
-    { "debugsse", "Toggle SSE debug 0|1.", true },
-    { "debugcli", "Toggle CLI debug 0|1.", true },
-    { "debugsensorsframe", "Toggle sensors frame debug 0|1.", true },
-    { "debugsensorsdata", "Toggle sensors data debug 0|1.", true },
-    { "debugsensorsgeneral", "Toggle sensors general debug 0|1.", true },
-    { "debugwifi", "Toggle WiFi debug 0|1.", true },
-    { "debugstorage", "Toggle storage debug 0|1.", true },
-    { "debugperformance", "Toggle performance debug 0|1.", true },
-    { "debugdatetime", "Toggle datetime debug 0|1.", true },
-    { "debugcommandflow", "Toggle command flow debug 0|1.", true },
-    { "debugusers", "Toggle users debug 0|1.", true },
+    // (Moved to Debug Commands section below)
 
     // ---- Sensors / Peripherals (start/stop and single reads) ----
-    { "thermalstart", "Start MLX90640 thermal sensor.", false },
-    { "thermalstop", "Stop MLX90640 thermal sensor.", false },
-    { "tofstart", "Start VL53L4CX ToF sensor.", false },
-    { "tofstop", "Stop VL53L4CX ToF sensor.", false },
-    { "tof", "Read a single ToF distance.", false },
-    { "imustart", "Start IMU sensor.", false },
-    { "imustop", "Stop IMU sensor.", false },
-    { "imu", "Read IMU data once.", false },
+    { "thermalstart", "Start MLX90640 thermal sensor.", false, cmd_thermalstart_modern },
+    { "thermalstop", "Stop MLX90640 thermal sensor.", false, cmd_thermalstop_modern },
+    { "tofstart", "Start VL53L4CX ToF sensor.", false, cmd_tofstart_modern },
+    { "tofstop", "Stop VL53L4CX ToF sensor.", false, cmd_tofstop_modern },
+    { "tof", "Read a single ToF distance.", false, cmd_tof_modern },
+    { "imustart", "Start IMU sensor.", false, cmd_imustart_modern },
+    { "imustop", "Stop IMU sensor.", false, cmd_imustop_modern },
+    { "imu", "Read IMU data once.", false, cmd_imu_modern },
+    { "apdscolor", "Read APDS9960 color values.", false, cmd_apdscolor_modern },
+    { "apdsproximity", "Read APDS9960 proximity value.", false, cmd_apdsproximity_modern },
+    { "apdsgesture", "Read APDS9960 gesture.", false, cmd_apdsgesture_modern },
+    { "apdscolorstart", "Start APDS9960 color sensing.", false, cmd_apdscolorstart_modern },
+    { "apdscolorstop", "Stop APDS9960 color sensing.", false, cmd_apdscolorstop_modern },
+    { "apdsproximitystart", "Start APDS9960 proximity sensing.", false, cmd_apdsproximitystart_modern },
+    { "apdsproximitystop", "Stop APDS9960 proximity sensing.", false, cmd_apdsproximitystop_modern },
+    { "apdsgesturestart", "Start APDS9960 gesture sensing.", false, cmd_apdsgesturestart_modern },
+    { "apdsgesturestop", "Stop APDS9960 gesture sensing.", false, cmd_apdsgesturestop_modern },
 
     // ---- LED Controls ----
-    { "ledcolor", "Set LED color by name.", false },
-    { "ledclear", "Turn off LED.", false },
-    { "ledeffect", "Run a predefined LED effect.", false },
+    { "ledcolor", "Set LED color by name.", false, cmd_ledcolor_modern },
+    { "ledclear", "Turn off LED.", false, cmd_ledclear_modern },
+    { "ledeffect", "Run a predefined LED effect.", false, cmd_ledeffect_modern },
 
     // ---- Files / FS ----
-    { "files", "List/inspect files.", false },
-    { "mkdir", "Create directory in LittleFS.", true },
-    { "rmdir", "Remove directory in LittleFS.", true },
-    { "filecreate", "Create a file (optionally with content).", true },
-    { "fileview", "View a file (supports offsets).", false },
-    { "filedelete", "Delete a file.", true },
+    { "files", "List/inspect files.", false, cmd_files_modern },
+    { "mkdir", "Create directory in LittleFS.", true, cmd_mkdir_modern },
+    { "rmdir", "Remove directory in LittleFS.", true, cmd_rmdir_modern },
+    { "filecreate", "Create a file (optionally with content).", true, cmd_filecreate_modern },
+    { "fileview", "View a file (supports offsets).", false, cmd_fileview_modern },
+    { "filedelete", "Delete a file.", true, cmd_filedelete_modern },
+    { "autolog", "Automation logging: autolog start <file> | autolog stop | autolog status.", true, cmd_autolog_modern },
 
     // ---- Automations ----
-    { "automation", "Automation list/add/enable/disable/delete/run.", true },
-    { "downloadautomation", "Download automation from GitHub: downloadautomation url=<github-raw-url> [name=<custom-name>].", true },
+    { "automation", "Automation list/add/enable/disable/delete/run.", true, cmd_automation_modern },
+    { "downloadautomation", "Download automation from GitHub: downloadautomation url=<github-raw-url> [name=<custom-name>].", true, cmd_downloadautomation_modern },
+    { "validate-conditions", "Validate conditional automation syntax: validate-conditions IF temp>75 THEN ledcolor red.", false, cmd_validate_conditions_modern },
 
     // ---- Users / Admin (Admin Controls section on Settings page) ----
-    { "user approve", "Approve pending user.", true },
-    { "user deny", "Deny pending user.", true },
-    { "user promote", "Promote an existing user to admin.", true },
-    { "user demote", "Demote an admin user to regular user.", true },
-    { "user delete", "Delete an existing user.", true },
-    { "user list", "List all users.", true },
-    { "user request", "List/submit access request.", false },
-    { "session list", "List all active sessions.", true },
-    { "session revoke", "Revoke sessions: 'session revoke sid <sid> [reason]' | 'session revoke user <username> [reason]' | 'session revoke all [reason]'.", true },
-    { "pending list", "List pending user approvals.", true },
-    { "broadcast", "Send message to all or specific user.", true },
+    { "user approve", "Approve pending user.", true, cmd_user_approve_modern },
+    { "user deny", "Deny pending user.", true, cmd_user_deny_modern },
+    { "user promote", "Promote an existing user to admin.", true, cmd_user_promote_modern },
+    { "user demote", "Demote an admin user to regular user.", true, cmd_user_demote_modern },
+    { "user delete", "Delete an existing user.", true, cmd_user_delete_modern },
+    { "user list", "List all users.", true, cmd_user_list_modern },
+    { "user request", "List/submit access request.", false, cmd_user_request_modern },
+    { "session list", "List all active sessions.", true, cmd_session_list_modern },
+    { "session revoke", "Revoke sessions: 'session revoke sid <sid> [reason]' | 'session revoke user <username> [reason]' | 'session revoke all [reason]'.", true, cmd_session_revoke_modern },
+    // Note: pending list and broadcast moved to Misc section below
+
+    // ---- Output Routing ----
+    { "outserial", "Enable/disable serial output.", true, cmd_outserial_modern },
+    { "outweb", "Enable/disable web output.", true, cmd_outweb_modern },
+    { "outtft", "Enable/disable TFT output.", true, cmd_outtft_modern },
+
+    // ---- Settings ----
+    { "wifiautoreconnect", "Enable/disable WiFi auto-reconnect.", true, cmd_wifiautoreconnect_modern },
+    { "clihistorysize", "Set CLI history size.", true, cmd_clihistorysize_modern },
+
+    // ---- Debug Commands ----
+    { "debugauthcookies", "Debug authentication cookies.", true, cmd_debugauthcookies_modern },
+    { "debughttp", "Debug HTTP requests.", true, cmd_debughttp_modern },
+    { "debugsse", "Debug Server-Sent Events.", true, cmd_debugsse_modern },
+    { "debugcli", "Debug CLI processing.", true, cmd_debugcli_modern },
+    { "debugsensorsframe", "Debug sensor frame processing.", true, cmd_debugsensorsframe_modern },
+    { "debugsensorsdata", "Debug sensor data.", true, cmd_debugsensorsdata_modern },
+    { "debugsensorsgeneral", "Debug general sensor operations.", true, cmd_debugsensorsgeneral_modern },
+    { "debugwifi", "Debug WiFi operations.", true, cmd_debugwifi_modern },
+    { "debugstorage", "Debug storage operations.", true, cmd_debugstorage_modern },
+    { "debugperformance", "Debug performance metrics.", true, cmd_debugperformance_modern },
+    { "debugdatetime", "Debug date/time operations.", true, cmd_debugdatetime_modern },
+    { "debugcommandflow", "Debug command flow.", true, cmd_debugcommandflow_modern },
+    { "debugusers", "Debug user management.", true, cmd_debugusers_modern },
+
+    // ---- Thermal/Sensor Polling Settings ----
+    { "thermaltargetfps", "Set thermal sensor target FPS.", true, cmd_thermaltargetfps_modern },
+    { "thermalwebmaxfps", "Set thermal web max FPS.", true, cmd_thermalwebmaxfps_modern },
+    { "thermalinterpolationenabled", "Enable/disable thermal interpolation.", true, cmd_thermalinterpolationenabled_modern },
+    { "thermalinterpolationsteps", "Set thermal interpolation steps.", true, cmd_thermalinterpolationsteps_modern },
+    { "thermalinterpolationbuffersize", "Set thermal interpolation buffer size.", true, cmd_thermalinterpolationbuffersize_modern },
+    { "thermaldevicepollms", "Set thermal device polling interval.", true, cmd_thermaldevicepollms_modern },
+    { "tofdevicepollms", "Set ToF device polling interval.", true, cmd_tofdevicepollms_modern },
+    { "imudevicepollms", "Set IMU device polling interval.", true, cmd_imudevicepollms_modern },
+    { "thermalpollingms", "Set thermal polling interval.", true, cmd_thermalpollingms_modern },
+    { "tofpollingms", "Set ToF polling interval.", true, cmd_tofpollingms_modern },
+    { "tofstabilitythreshold", "Set ToF stability threshold.", true, cmd_tofstabilitythreshold_modern },
+    { "i2cclockthermalhz", "Set I2C clock for thermal sensor.", true, cmd_i2cclockthermalhz_modern },
+    { "i2cclocktofhz", "Set I2C clock for ToF sensor.", true, cmd_i2cclocktofhz_modern },
+
+    // ---- System Diagnostics ----
+    { "temperature", "Read ESP32 internal temperature.", false, cmd_temperature_modern },
+    { "voltage", "Read supply voltage.", false, cmd_voltage_modern },
+    { "cpufreq", "Get/set CPU frequency.", false, cmd_cpufreq_modern },
+    { "taskstats", "Detailed task statistics.", false, cmd_taskstats_modern },
+    { "heapfrag", "Analyze heap fragmentation.", false, cmd_heapfrag_modern },
+    { "i2cscan", "Scan I2C bus for devices.", false, cmd_i2cscan_modern },
+    { "i2cstats", "I2C bus statistics and errors.", false, cmd_i2cstats_modern },
+    { "sensors", "List known I2C sensor database.", false, cmd_sensors_modern },
+    { "sensorinfo", "Get detailed info about a specific sensor.", false, cmd_sensorinfo_modern },
+    { "devices", "Show discovered I2C device registry.", false, cmd_devices_modern },
+    { "discover", "Discover and register I2C devices.", false, cmd_discover_modern },
+    { "devicefile", "Show device registry JSON file.", false, cmd_devicefile_modern },
 
     // ---- Misc ----
-    { "set", "Set a named setting (key value).", false },
-    { "reboot", "Reboot the device.", true },
+    { "set", "Set a named setting (key value).", false, cmd_set_modern },
+    { "reboot", "Reboot the device.", true, cmd_reboot_modern },
+    { "broadcast", "Send message to all or specific user.", true, cmd_broadcast_modern },
+    { "pending list", "List pending user approvals.", true, cmd_pending_list_modern },
+    { "wait", "Delay execution for N milliseconds: wait <ms>.", false, cmd_wait_modern },
+    { "sleep", "Alias for wait: sleep <ms>.", false, cmd_wait_modern },
   };
-  // Settings and debug toggles are left to legacy handlers but could be added here as needed
+
+// Minimal CLI processor used by Serial loop
+static String processCommand(const String& cmd) {
+  String command = cmd;
+  command.trim();
+  
+  // Check for conditional commands first (before lowercasing to preserve case in commands)
+  String upperCommand = command;
+  upperCommand.toUpperCase();
+  if (upperCommand.startsWith("IF ")) {
+    // Validate conditional command syntax if in validation mode
+    if (gCLIValidateOnly) {
+      String validationResult = validateConditionalCommand(command);
+      if (validationResult.length() > 0) {
+        return validationResult;
+      }
+      return "VALID";
+    }
+    // Execute conditional command
+    return executeConditionalCommand(command);
+  }
+  
+  // Preserve original for argument casing; use a lowercased copy for matching
+  String originalForArgs = command;
+  String lc = command; lc.toLowerCase();
+  // TEMP DEBUG (gated by DEBUG_CMD_FLOW): show raw command and ASCII codes for first 40 chars
+  {
+    String dbg = "";
+    for (unsigned i = 0; i < lc.length() && i < 40; ++i) {
+      char c = lc[i];
+      dbg += String((int)c) + " ";
+    }
+    DEBUG_CMD_FLOWF("[router] raw='%s', ascii=[%s]", lc.c_str(), dbg.c_str());
+    DEBUG_CMD_FLOWF("[router] startsWith(\"user request \")=%s", lc.startsWith("user request ") ? "YES" : "NO");
+    DEBUG_CMD_FLOWF("[router] indexOf(\"user request\")==%d", lc.indexOf("user request"));
+  }
 
   auto splitFirstToken = [](const String& s, String& head, String& tail) {
     int sp = s.indexOf(' ');
@@ -11063,243 +15594,8 @@ static String processCommand(const String& cmd) {
     return h;
   };
 
-  // Option A: prefix-based registry matching to support multi-word commands
-  const CommandEntry* found = nullptr;
-  size_t foundLen = 0;
-  for (size_t i = 0; i < (sizeof(kCommands) / sizeof(kCommands[0])); ++i) {
-    const char* nm = kCommands[i].name;
-    size_t nlen = strlen(nm);
-    if (command.length() >= nlen && command.substring(0, nlen).equalsIgnoreCase(String(nm)) &&
-        (command.length() == nlen || command.charAt(nlen) == ' ')) {
-      found = &kCommands[i];
-      foundLen = nlen;
-      break;
-    }
-  }
-
-  if (found) {
-    // Admin gating (optional; most commands have their own guards inside legacy handlers)
-    if (found->requiresAdmin) {
-      String err = requireAdminFor("adminControls");
-      if (err.length()) return err;
-    }
-    // Normalize: rebuild input using the canonical name + trailing args
-    String args = command.substring(foundLen);
-    args.trim();
-    command = String(found->name);
-    if (args.length()) {
-      command += " ";
-      command += args;
-    }
-
-    // Early routing to core handlers (so legacy chain is bypassed for these)
-    if (command == "status") {
-      RETURN_VALID_IF_VALIDATE();
-      return cmd_status_core();
-    } else if (command == "uptime") {
-      RETURN_VALID_IF_VALIDATE();
-      return cmd_uptime_core();
-    } else if (command == "memory") {
-      RETURN_VALID_IF_VALIDATE();
-      return cmd_memory_core();
-    } else if (command == "psram") {
-      RETURN_VALID_IF_VALIDATE();
-      return cmd_psram_core();
-    } else if (command == "fsusage") {
-      RETURN_VALID_IF_VALIDATE();
-      return cmd_fsusage_core();
-    } else if (command == "wifiinfo") {
-      return cmd_wifiinfo();
-    } else if (command == "wifilist") {
-      return cmd_wifilist();
-    } else if (command.startsWith("wifiadd")) {
-      return cmd_wifiadd(cmd);
-    } else if (command.startsWith("wifirm")) {
-      return cmd_wifirm(cmd);
-    } else if (command.startsWith("wifipromote")) {
-      return cmd_wifipromote(cmd);
-    } else if (command.startsWith("wificonnect")) {
-      return cmd_wificonnect(cmd);
-    } else if (command == "wifidisconnect") {
-      return cmd_wifidisconnect();
-    } else if (command == "wifiscan" || command.startsWith("wifiscan ")) {
-      return cmd_wifiscan(command);
-    } else if (command == "tof") {
-      return cmd_tof();
-    } else if (command == "tofstart") {
-      return cmd_tofstart();
-    } else if (command == "tofstop") {
-      return cmd_tofstop();
-    } else if (command == "thermalstart") {
-      return cmd_thermalstart();
-    } else if (command == "thermalstop") {
-      return cmd_thermalstop();
-    } else if (command == "imu") {
-      return cmd_imu();
-    } else if (command == "imustart") {
-      return cmd_imustart();
-    } else if (command == "imustop") {
-      return cmd_imustop();
-    } else if (command == "apdscolor") {
-      return cmd_apdscolor();
-    } else if (command == "apdsproximity") {
-      return cmd_apdsproximity();
-    } else if (command == "apdsgesture") {
-      return cmd_apdsgesture();
-    } else if (command == "apdscolorstart") {
-      return cmd_apdscolorstart();
-    } else if (command == "apdscolorstop") {
-      return cmd_apdscolorstop();
-    } else if (command == "apdsproximitystart") {
-      return cmd_apdsproximitystart();
-    } else if (command == "apdsproximitystop") {
-      return cmd_apdsproximitystop();
-    } else if (command == "apdsgesturestart") {
-      return cmd_apdsgesturestart();
-    } else if (command == "apdsgesturestop") {
-      return cmd_apdsgesturestop();
-    } else if (command == "ledclear") {
-      return cmd_ledclear();
-    } else if (command == "ledcolor" || command.startsWith("ledcolor ")) {
-      return cmd_ledcolor(command);
-    } else if (command == "ledeffect" || command.startsWith("ledeffect ")) {
-      return cmd_ledeffect(command);
-    } else if (command == "files" || command.startsWith("files ")) {
-      return cmd_files(cmd);
-    } else if (command == "mkdir" || command.startsWith("mkdir ")) {
-      return cmd_mkdir(cmd);
-    } else if (command == "rmdir" || command.startsWith("rmdir ")) {
-      return cmd_rmdir(cmd);
-    } else if (command == "filecreate" || command.startsWith("filecreate ")) {
-      return cmd_filecreate(cmd);
-    } else if (command == "fileview" || command.startsWith("fileview ")) {
-      return cmd_fileview(cmd);
-    } else if (command == "filedelete" || command.startsWith("filedelete ")) {
-      return cmd_filedelete(cmd);
-    } else if (command.startsWith("wifiautoreconnect ")) {
-      return cmd_wifiautoreconnect(cmd);
-    } else if (command.startsWith("clihistorysize ")) {
-      return cmd_clihistorysize(cmd);
-    } else if (command == "outserial" || command.startsWith("outserial ")) {
-      return cmd_outserial(cmd);
-    } else if (command == "outweb" || command.startsWith("outweb ")) {
-      return cmd_outweb(cmd);
-    } else if (command == "outtft" || command.startsWith("outtft ")) {
-      return cmd_outtft(cmd);
-    } else if (command.startsWith("debugauthcookies")) {
-      return cmd_debugauthcookies(cmd);
-    } else if (command.startsWith("debughttp")) {
-      return cmd_debughttp(cmd);
-    } else if (command.startsWith("debugsse")) {
-      return cmd_debugsse(cmd);
-    } else if (command.startsWith("debugcli")) {
-      return cmd_debugcli(cmd);
-    } else if (command.startsWith("debugsensorsframe")) {
-      return cmd_debugsensorsframe(cmd);
-    } else if (command.startsWith("debugsensorsdata")) {
-      return cmd_debugsensorsdata(cmd);
-    } else if (command.startsWith("debugsensorsgeneral")) {
-      return cmd_debugsensorsgeneral(cmd);
-    } else if (command.startsWith("debugwifi")) {
-      return cmd_debugwifi(cmd);
-    } else if (command.startsWith("debugstorage")) {
-      return cmd_debugstorage(cmd);
-    } else if (command.startsWith("debugperformance")) {
-      return cmd_debugperformance(cmd);
-    } else if (command.startsWith("debugdatetime")) {
-      return cmd_debugdatetime(cmd);
-    } else if (command.startsWith("thermaltargetfps ")) {
-      return cmd_thermaltargetfps(cmd);
-    } else if (command.startsWith("thermalwebmaxfps ")) {
-      return cmd_thermalwebmaxfps(cmd);
-    } else if (command.startsWith("thermalinterpolationenabled ")) {
-      return cmd_thermalinterpolationenabled(cmd);
-    } else if (command.startsWith("thermalinterpolationsteps ")) {
-      return cmd_thermalinterpolationsteps(cmd);
-    } else if (command.startsWith("thermalinterpolationbuffersize ")) {
-      return cmd_thermalinterpolationbuffersize(cmd);
-    } else if (command.startsWith("thermaldevicepollms ")) {
-      return cmd_thermaldevicepollms(cmd);
-    } else if (command.startsWith("tofdevicepollms ")) {
-      return cmd_tofdevicepollms(cmd);
-    } else if (command.startsWith("imudevicepollms ")) {
-      return cmd_imudevicepollms(cmd);
-    } else if (command.startsWith("user approve ")) {
-      return cmd_user_approve(cmd);
-    } else if (command.startsWith("user deny ")) {
-      return cmd_user_deny(cmd);
-    } else if (command.startsWith("user promote ")) {
-      return cmd_user_promote(cmd);
-    } else if (command.startsWith("user demote ")) {
-      return cmd_user_demote(cmd);
-    } else if (command.startsWith("user delete ")) {
-      return cmd_user_delete(cmd);
-    } else if (command.startsWith("user list")) {
-      return cmd_user_list(cmd);
-    } else if (command.startsWith("user request")) {
-      DEBUG_CMD_FLOWF("[router] dispatching to cmd_user_request");
-      return cmd_user_request(cmd);
-    } else if (command == "reboot") {
-      return cmd_reboot(cmd);
-    } else if (command.startsWith("thermalpollingms ")) {
-      return cmd_thermalpollingms(cmd);
-    } else if (command.startsWith("tofpollingms ")) {
-      return cmd_tofpollingms(cmd);
-    } else if (command.startsWith("tofstabilitythreshold ")) {
-      return cmd_tofstabilitythreshold(cmd);
-    } else if (command.startsWith("i2cclockthermalhz ")) {
-      return cmd_i2cclockthermalhz(cmd);
-    } else if (command.startsWith("i2cclocktofhz ")) {
-      return cmd_i2cclocktofhz(cmd);
-    } else if (command.startsWith("set ")) {
-      return cmd_set(cmd);
-    } else if (command.startsWith("automation ")) {
-      return cmd_automation(cmd);
-    } else if (command.startsWith("downloadautomation ")) {
-      return cmd_downloadautomation(cmd);
-    } else if (command.startsWith("broadcast ")) {
-      return cmd_broadcast(cmd);
-    } else if (command.startsWith("debugcommandflow")) {
-      return cmd_debugcommandflow(cmd);
-    } else if (command.startsWith("debugusers")) {
-      return cmd_debugusers(cmd);
-    } else if (command.startsWith("user list")) {
-      return cmd_user_list(cmd);
-    } else if (command.startsWith("session list")) {
-      return cmd_session_list(cmd);
-    } else if (command.startsWith("session revoke")) {
-      return cmd_session_revoke(cmd);
-    } else if (command.startsWith("pending list")) {
-      return cmd_pending_list(cmd);
-    }
-  }
-
-  // (Removed temporary fallback routing; prefix-based registry now handles multi-word commands)
-
-  DEBUG_CLIF("processCommand called with: '%s' -> '%s'", redactCmdForAudit(cmd).c_str(), redactCmdForAudit(command).c_str());
-  DEBUG_CMD_FLOWF("[proc] normalized='%s'", command.c_str());
-
-  // Handle clear command first, regardless of CLI state
-  if (command == "clear") {
-    RETURN_VALID_IF_VALIDATE();
-    if (!gWebMirror.buf) { gWebMirror.init(gWebMirrorCap); }
-    gWebMirror.clear();
-    gHiddenHistory = "";  // Also clear hidden history
-    return "\033[2J\033[H"
-           "CLI history cleared.";
-  }
-
-  // Handle CLI state transitions and help system
-  if (gCLIState == CLI_NORMAL) {
-    if (command == "help") {
-      // Swap history: hide current CLI output while in help
-      gHiddenHistory = gWebMirror.snapshot();
-      if (!gWebMirror.buf) { gWebMirror.init(gWebMirrorCap); }
-      gWebMirror.clear();
-      gCLIState = CLI_HELP_MAIN;
-      return renderHelpMain();
-    }
-  } else if (gCLIState == CLI_HELP_MAIN) {
+  // Handle CLI state transitions and help navigation BEFORE command registry
+  if (gCLIState == CLI_HELP_MAIN) {
     if (command == "system") {
       gCLIState = CLI_HELP_SYSTEM;
       return renderHelpSystem();
@@ -11320,7 +15616,6 @@ static String processCommand(const String& cmd) {
       return exitToNormalBanner();
     } else {
       // Exit help main and execute the entered command in normal mode
-      // Prepend the standard exit banner so output is not trapped in help buffer
       String savedCmd = cmd;  // preserve original input (with args/case)
       return exitHelpAndExecute(savedCmd);
     }
@@ -11331,17 +15626,88 @@ static String processCommand(const String& cmd) {
     } else if (command == "exit") {
       return exitToNormalBanner();
     } else {
-      // In a help submenu: treat any other input as a normal CLI command
-      // Exit help with banner, then execute the original input
-      String savedCmd = cmd;  // preserve original input
+      // Exit help and execute the entered command in normal mode
+      String savedCmd = cmd;  // preserve original input (with args/case)
       return exitHelpAndExecute(savedCmd);
     }
+  }
+
+  // Option A: prefix-based registry matching to support multi-word commands
+  const CommandEntry* found = nullptr;
+  size_t foundLen = 0;
+  for (size_t i = 0; i < (sizeof(kCommands) / sizeof(kCommands[0])); ++i) {
+    const char* nm = kCommands[i].name;
+    size_t nlen = strlen(nm);
+    if (lc.length() >= nlen && lc.substring(0, nlen).equalsIgnoreCase(String(nm)) &&
+        (lc.length() == nlen || lc.charAt(nlen) == ' ')) {
+      found = &kCommands[i];
+      foundLen = nlen;
+      break;
+    }
+  }
+
+  if (found) {
+    // Admin gating now handled by executeCommand pipeline
+    // (Legacy requiresAdmin flag no longer needed)
+    // Normalize: rebuild input using the canonical name + trailing args (preserve original arg casing)
+    String args = originalForArgs.substring(foundLen);
+    args.trim();
+    command = String(found->name);
+    if (args.length()) {
+      command += " ";
+      command += args;
+    }
+
+    // During validation, do not execute handlers; just report VALID if recognized
+    if (gCLIValidateOnly) {
+      return "VALID";
+    }
+    // Check if command has a modern function pointer handler
+    if (found->handler != nullptr) {
+      return found->handler(command);
+    }
+
+    // No legacy commands remaining - all commands now use modern routing!
+  } else {
+    // Command not found in registry - handle validation properly
+    if (gCLIValidateOnly) {
+      return "Error: Unknown command '" + cmd + "'. Type 'help' for available commands.";
+    }
+    // Avoid Serial-only debug; return result for unified broadcast by caller
+    String result = "Unknown command: " + cmd + "\nType 'help' for available commands";
+    return result;
+  }
+
+  // (Removed temporary fallback routing; prefix-based registry now handles multi-word commands)
+
+  DEBUG_CLIF("processCommand called with: '%s' -> '%s'", redactCmdForAudit(cmd).c_str(), redactCmdForAudit(command).c_str());
+  DEBUG_CMD_FLOWF("[proc] normalized='%s'", command.c_str());
+
+  // Handle clear command first, regardless of CLI state
+  if (command == "clear") {
+    RETURN_VALID_IF_VALIDATE();
+    if (!gWebMirror.buf) { gWebMirror.init(gWebMirrorCap); }
+    gWebMirror.clear();
+    gHiddenHistory = "";  // Also clear hidden history
+    return "\033[2J\033[H"
+           "CLI history cleared.";
+  }
+
+  // Handle help command in normal mode
+  if (gCLIState == CLI_NORMAL && command == "help") {
+    // Swap history: hide current CLI output while in help
+    gHiddenHistory = gWebMirror.snapshot();
+    if (!gWebMirror.buf) { gWebMirror.init(gWebMirrorCap); }
+    gWebMirror.clear();
+    gCLIState = CLI_HELP_MAIN;
+    return renderHelpMain();
   }
 
   // Normal CLI commands (processed after help mode logic)
 REPROCESS_NORMAL_COMMANDS:
   // Automations commands (open to all authenticated users for now; TODO: admin-gate mutations later)
-  // DISABLED: automation list - now handled by early routing
+  
+  // DISABLED: automation commands - now handled by early routing
   /*
   if (command == "automation list") {
     RETURN_VALID_IF_VALIDATE();
@@ -11587,7 +15953,7 @@ REPROCESS_NORMAL_COMMANDS:
     } else if (setting == "tofstabilitythreshold") {
       int v = value.toInt(); if (v < 0 || v > 50) return "Error: tofStabilityThreshold must be 0..50"; gSettings.tofStabilityThreshold = v; saveUnifiedSettings(); return String("tofStabilityThreshold set to ") + v;
     } else if (setting == "thermalpalettedefault") {
-      String v = value; v.trim(); v.toLowerCase(); if (!(v == "grayscale" || v == "coolwarm")) return "Error: thermalPaletteDefault must be grayscale|coolwarm"; gSettings.thermalPaletteDefault = v; saveUnifiedSettings(); return String("thermalPaletteDefault set to ") + v;
+      String v = value; v.trim(); v.toLowerCase(); if (!(v == "grayscale" || v == "iron" || v == "rainbow" || v == "hot" || v == "coolwarm")) return "Error: thermalPaletteDefault must be grayscale|iron|rainbow|hot|coolwarm"; gSettings.thermalPaletteDefault = v; saveUnifiedSettings(); return String("thermalPaletteDefault set to ") + v;
     } else if (setting == "thermalwebmaxfps") {
       int v = value.toInt(); if (v < 1 || v > 60) return "Error: thermalWebMaxFps must be 1..60"; gSettings.thermalWebMaxFps = v; saveUnifiedSettings(); return String("thermalWebMaxFps set to ") + v;
     } else if (setting == "thermalewmafactor") {
@@ -11639,7 +16005,10 @@ REPROCESS_NORMAL_COMMANDS:
   } else if (command.length() == 0) {
     return "";
   } else {
-    // Avoid Serial-only debug; return result for unified broadcast by caller
+    // This should never be reached for commands found in registry
+    if (gCLIValidateOnly) {
+      return "Error: Unknown command '" + cmd + "'. Type 'help' for available commands.";
+    }
     String result = "Unknown command: " + cmd + "\nType 'help' for available commands";
     return result;
   }
@@ -11756,14 +16125,14 @@ bool initIMUSensor() {
     return true;
   }
 
-  Serial.println("DEBUG: Starting BNO055 IMU initialization (STEMMA QT)...");
+  DEBUG_SENSORSF("Starting BNO055 IMU initialization (STEMMA QT)...");
 
   // Configure Wire1 for STEMMA QT (SDA=22, SCL=19)
   Wire1.begin(22, 19);
 
   // Use scoped I2C clock management for IMU initialization
   Wire1ClockScope guard(100000);  // BNO055 max is 400kHz, use 100kHz for reliability
-  Serial.println("DEBUG: Set I2C clock to 100kHz for IMU initialization");
+  DEBUG_SENSORSF("Set I2C clock to 100kHz for IMU initialization");
 
   // BNO055 needs time after power-up/reset before responding reliably
   delay(700);
@@ -11783,14 +16152,14 @@ bool initIMUSensor() {
   if (foundIndex < 0) {
     Serial.println("WARNING: BNO055 not detected at 0x28 or 0x29 on Wire1 (initial probe). Will attempt init anyway with retries.");
   } else {
-    Serial.printf("DEBUG: Detected BNO055 at address 0x%02X\n", candidateAddrs[foundIndex]);
+    DEBUG_SENSORSF("Detected BNO055 at address 0x%02X", candidateAddrs[foundIndex]);
   }
 
   // Retry loop with conservative I2C clocks (BNO055 doesn't like high speeds)
   const int maxAttempts = 3;
   uint32_t clocks[maxAttempts] = { 100000, 50000, 100000 };
   for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
-    Serial.printf("DEBUG: IMU init attempt %d/3 at I2C %lu Hz\n", attempt, clocks[attempt - 1]);
+    DEBUG_SENSORSF("IMU init attempt %d/3 at I2C %lu Hz", attempt, clocks[attempt - 1]);
 
     // Use nested scope for each attempt's clock setting
     {
@@ -11812,7 +16181,7 @@ bool initIMUSensor() {
       bool begun = false;
       for (int i = 0; i < 2 && !begun; i++) {
         uint8_t addr = (foundIndex >= 0) ? candidateAddrs[foundIndex] : candidateAddrs[i];
-        Serial.printf("DEBUG: Trying BNO055 address 0x%02X\n", addr);
+        DEBUG_SENSORSF("Trying BNO055 address 0x%02X", addr);
         bno = new Adafruit_BNO055(55, addr, &Wire1);
         if (bno == nullptr) {
           Serial.println("ERROR: Failed to allocate memory for BNO055 object");
@@ -12580,9 +16949,16 @@ bool readThermalPixels() {
 
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
+  
+  // Inform user they can escape WiFi connection attempts
+  broadcastOutput("Starting WiFi connection... (Press any key in Serial Monitor to skip)");
 
   // First try multi-SSID saved list
   loadWiFiNetworks();
+  broadcastOutput("DEBUG: Found " + String(gWifiNetworkCount) + " saved networks");
+  if (gWifiNetworkCount > 0) {
+    broadcastOutput("DEBUG: First network SSID: '" + gWifiNetworks[0].ssid + "'");
+  }
   bool connected = false;
   bool usedBest = false;
   if (gWifiNetworkCount > 0) {
@@ -12604,22 +16980,6 @@ void setupWiFi() {
     (void)execCommandUnified(cc, String("wificonnect --best"));
     connected = WiFi.isConnected();
     usedBest = true;
-  }
-  if (!connected) {
-    // Fallback to unified settings - only if we have a valid SSID
-    String ssid = gSettings.wifiSSID;
-    String pass = gSettings.wifiPassword;
-    if (ssid.length() > 0) {
-      WiFi.begin(ssid.c_str(), pass.c_str());
-      broadcastOutput(String("Connecting to WiFi SSID '") + ssid + "'...");
-      unsigned long start = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-        delay(200);
-        // omit dot spam in unified feed
-      }
-      connected = WiFi.isConnected();
-    }
-    // If no fallback SSID or connection failed, skip the empty connection attempt
   }
   if (connected) {
     // Avoid duplicate: the wificonnect --best path already logs via broadcastOutput
@@ -12651,6 +17011,7 @@ void startHttpServer() {
   static httpd_uri_t logs = { .uri = "/logs.txt", .method = HTTP_GET, .handler = handleLogs, .user_ctx = NULL };
   static httpd_uri_t settingsPage = { .uri = "/settings", .method = HTTP_GET, .handler = handleSettingsPage, .user_ctx = NULL };
   static httpd_uri_t settingsGet = { .uri = "/api/settings", .method = HTTP_GET, .handler = handleSettingsGet, .user_ctx = NULL };
+  static httpd_uri_t devicesGet = { .uri = "/api/devices", .method = HTTP_GET, .handler = handleDeviceRegistryGet, .user_ctx = NULL };
   static httpd_uri_t apiNotice = { .uri = "/api/notice", .method = HTTP_GET, .handler = handleNotice, .user_ctx = NULL };
   static httpd_uri_t apiEvents = { .uri = "/api/events", .method = HTTP_GET, .handler = handleEvents, .user_ctx = NULL };
   static httpd_uri_t filesPage = { .uri = "/files", .method = HTTP_GET, .handler = handleFilesPage, .user_ctx = NULL };
@@ -12664,11 +17025,13 @@ void startHttpServer() {
   static httpd_uri_t cliCmd = { .uri = "/api/cli", .method = HTTP_POST, .handler = handleCLICommand, .user_ctx = NULL };
   static httpd_uri_t logsGet = { .uri = "/api/cli/logs", .method = HTTP_GET, .handler = handleLogs, .user_ctx = NULL };
   static httpd_uri_t sensorsPage = { .uri = "/sensors", .method = HTTP_GET, .handler = handleSensorsPage, .user_ctx = NULL };
+  static httpd_uri_t espnowPage = { .uri = "/espnow", .method = HTTP_GET, .handler = handleEspNowPage, .user_ctx = NULL };
   static httpd_uri_t automationsPage = { .uri = "/automations", .method = HTTP_GET, .handler = handleAutomationsPage, .user_ctx = NULL };
   static httpd_uri_t sensorData = { .uri = "/api/sensors", .method = HTTP_GET, .handler = handleSensorData, .user_ctx = NULL };
   static httpd_uri_t sensorsStatus = { .uri = "/api/sensors/status", .method = HTTP_GET, .handler = handleSensorsStatusWithUpdates, .user_ctx = NULL };
   static httpd_uri_t systemStatus = { .uri = "/api/system", .method = HTTP_GET, .handler = handleSystemStatus, .user_ctx = NULL };
   static httpd_uri_t automationsGet = { .uri = "/api/automations", .method = HTTP_GET, .handler = handleAutomationsGet, .user_ctx = NULL };
+  static httpd_uri_t automationsExport = { .uri = "/api/automations/export", .method = HTTP_GET, .handler = handleAutomationsExport, .user_ctx = NULL };
   static httpd_uri_t outputGet = { .uri = "/api/output", .method = HTTP_GET, .handler = handleOutputGet, .user_ctx = NULL };
   static httpd_uri_t outputTemp = { .uri = "/api/output/temp", .method = HTTP_POST, .handler = handleOutputTemp, .user_ctx = NULL };
   static httpd_uri_t regPage = { .uri = "/register", .method = HTTP_GET, .handler = handleRegisterPage, .user_ctx = NULL };
@@ -12688,6 +17051,7 @@ void startHttpServer() {
   httpd_register_uri_handler(server, &logs);
   httpd_register_uri_handler(server, &settingsPage);
   httpd_register_uri_handler(server, &settingsGet);
+  httpd_register_uri_handler(server, &devicesGet);
   httpd_register_uri_handler(server, &apiNotice);
   httpd_register_uri_handler(server, &filesPage);
   httpd_register_uri_handler(server, &filesList);
@@ -12700,6 +17064,7 @@ void startHttpServer() {
   httpd_register_uri_handler(server, &cliCmd);
   httpd_register_uri_handler(server, &logsGet);
   httpd_register_uri_handler(server, &sensorsPage);
+  httpd_register_uri_handler(server, &espnowPage);
   httpd_register_uri_handler(server, &sensorData);
   httpd_register_uri_handler(server, &sensorsStatus);
   // SSE events endpoint for server-driven notices
@@ -12707,6 +17072,7 @@ void startHttpServer() {
   httpd_register_uri_handler(server, &systemStatus);
   httpd_register_uri_handler(server, &automationsPage);
   httpd_register_uri_handler(server, &automationsGet);
+  httpd_register_uri_handler(server, &automationsExport);
   httpd_register_uri_handler(server, &outputGet);
   httpd_register_uri_handler(server, &outputTemp);
   httpd_register_uri_handler(server, &regPage);

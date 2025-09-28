@@ -133,6 +133,26 @@ String getSettingsPage(const String& username) {
   inner += "</div>";     // cli wrapper
   inner += "<script>try{ console.debug('[SNSR] CLIHistorySize ready'); }catch(_){}</script>";
 
+  // ESP-NOW Section (collapsible)
+  inner += "<div style='background:#f8f9fa;border-radius:8px;padding:1.0rem 1.5rem;margin:1rem 0;border-left:4px solid #28a745;color:#333'>";
+  inner += "  <div style='display:flex;align-items:center;justify-content:space-between'>";
+  inner += "    <div><div style='font-size:1.2rem;font-weight:bold;color:#333'>ESP-NOW Communication</div><div style='color:#666;font-size:0.9rem'>Enable ESP-NOW wireless protocol for direct device-to-device messaging.</div></div>";
+  inner += "    <button class='btn' id='btn-espnow-toggle' onclick=\"togglePane('espnow-pane','btn-espnow-toggle')\">Expand</button>";
+  inner += "  </div>";
+  inner += "  <div id='espnow-pane' style='display:none;margin-top:0.75rem'>";
+  inner += "  <div style='display:flex;align-items:center;gap:1rem;margin-bottom:1rem;flex-wrap:wrap'>";
+  inner += "    <span style='color:#333' title='Enable ESP-NOW protocol on boot (requires reboot to take effect)'>ESP-NOW Enabled: <span style='font-weight:bold;color:#28a745' id='espnow-value'>-</span></span>";
+  inner += "    <button class='btn' onclick='toggleEspNow()' id='espnow-btn' title='Enable/disable ESP-NOW protocol'>Toggle</button>";
+  inner += "  </div>";
+  inner += "  <div style='background:#e8f5e8;border:1px solid #c3e6c3;border-radius:6px;padding:0.75rem;margin-top:0.75rem'>";
+  inner += "    <div style='color:#155724;font-size:0.9rem'>";
+  inner += "      <strong>Note:</strong> ESP-NOW changes take effect after reboot. When enabled, the device will automatically initialize ESP-NOW on startup.";
+  inner += "    </div>";
+  inner += "  </div>";
+  inner += "  </div>";
+  inner += "</div>";
+  inner += "<script>try{ console.debug('[SNSR] ESP-NOW ready'); }catch(_){}</script>";
+
   // Sensors UI Settings (collapsible)
   inner += "<div style='background:#f8f9fa;border-radius:8px;padding:1.0rem 1.5rem;margin:1rem 0;border-left:4px solid #667eea;color:#333'>";
   inner += "  <div style='display:flex;align-items:center;justify-content:space-between'>";
@@ -144,7 +164,7 @@ String getSettingsPage(const String& username) {
   inner += "    <label title=\"How often the thermal camera UI fetches frames. Higher = less CPU/network, lower = smoother updates.\">Thermal Polling (ms)<br><input type='number' id='thermalPollingMs' min='100' max='2000' step='50' value='200' style='padding:0.5rem;border:1px solid #ddd;border-radius:4px;width:140px' title='Polling interval for thermal UI'></label>";
   inner += "    <label title=\"How often the ToF UI fetches distance data.\">ToF Polling (ms)<br><input type='number' id='tofPollingMs' min='100' max='2000' step='50' value='300' style='padding:0.5rem;border:1px solid #ddd;border-radius:4px;width:140px' title='Polling interval for ToF UI'></label>";
   inner += "    <label title=\"Number of consecutive stable ToF readings required before updating the displayed value.\">ToF Stability Threshold<br><input type='number' id='tofStabilityThreshold' min='1' max='10' step='1' value='3' style='padding:0.5rem;border:1px solid #ddd;border-radius:4px;width:140px' title='Stability filter for ToF display'></label>";
-  inner += "    <label title=\"Default color palette for thermal visualization.\">Thermal Default Palette<br><select id='thermalPaletteDefault' class='menu-item' style='padding:0.4rem;width:160px' title='Default thermal palette'><option value='grayscale'>Grayscale</option><option value='coolwarm'>Coolwarm</option></select></label>";
+  inner += "    <label title=\"Default color palette for thermal visualization.\">Thermal Default Palette<br><select id='thermalPaletteDefault' class='menu-item' style='padding:0.4rem;width:160px' title='Default thermal palette'><option value='grayscale'>Grayscale</option><option value='iron'>Iron</option><option value='rainbow'>Rainbow</option><option value='hot'>Hot</option><option value='coolwarm'>Coolwarm</option></select></label>";
   inner += "    <label title=\"Maximum UI update rate for thermal rendering (client throttle).\">Thermal Web Max FPS<br><input type='number' id='thermalWebMaxFps' min='1' max='20' step='1' value='10' style='padding:0.5rem;border:1px solid #ddd;border-radius:4px;width:140px' title='Max FPS for web UI polling'></label>";
   inner += "    <label title=\"Smoothing factor for thermal values (0 = no smoothing, 1 = very slow changes).\">Thermal EWMA Factor (0..1)<br><input type='number' id='thermalEWMAFactor' min='0' max='1' step='0.05' value='0.2' style='padding:0.5rem;border:1px solid #ddd;border-radius:4px;width:140px' title='EWMA smoothing factor'></label>";
   inner += "    <label title=\"Animation duration for thermal color updates.\">Thermal Transition (ms)<br><input type='number' id='thermalTransitionMs' min='0' max='500' step='10' value='120' style='padding:0.5rem;border:1px solid #ddd;border-radius:4px;width:140px' title='Thermal transition duration'></label>";
@@ -285,6 +305,7 @@ String getSettingsPage(const String& username) {
   inner += "$('wifi-value').textContent = s.wifiAutoReconnect ? 'Enabled':'Disabled';";
   inner += "$('cli-value').textContent = s.cliHistorySize; $('cli-input').value = s.cliHistorySize;";
   inner += "$('wifi-btn').textContent = s.wifiAutoReconnect ? 'Disable':'Enable';";
+  inner += "$('espnow-value').textContent = s.espnowenabled ? 'Enabled':'Disabled'; $('espnow-btn').textContent = s.espnowenabled ? 'Disable':'Enable';";
   inner += "var tzOffset = s.tzOffsetMinutes; var tzName = 'UTC' + (tzOffset >= 0 ? '+' : '') + (tzOffset / 60); if (tzOffset === -720) tzName = 'UTC-12 (Baker Island)'; else if (tzOffset === -660) tzName = 'UTC-11 (Hawaii-Aleutian)'; else if (tzOffset === -600) tzName = 'UTC-10 (Hawaii)'; else if (tzOffset === -540) tzName = 'UTC-9 (Alaska)'; else if (tzOffset === -480) tzName = 'UTC-8 (Pacific)'; else if (tzOffset === -420) tzName = 'UTC-7 (Mountain)'; else if (tzOffset === -360) tzName = 'UTC-6 (Central)'; else if (tzOffset === -300) tzName = 'UTC-5 (Eastern)'; else if (tzOffset === -240) tzName = 'UTC-4 (Atlantic)'; else if (tzOffset === -180) tzName = 'UTC-3 (Argentina)'; else if (tzOffset === -120) tzName = 'UTC-2 (Mid-Atlantic)'; else if (tzOffset === -60) tzName = 'UTC-1 (Azores)'; else if (tzOffset === 0) tzName = 'UTC+0 (London/Dublin)'; else if (tzOffset === 60) tzName = 'UTC+1 (Berlin/Paris)'; else if (tzOffset === 120) tzName = 'UTC+2 (Cairo/Athens)'; else if (tzOffset === 180) tzName = 'UTC+3 (Moscow/Baghdad)'; else if (tzOffset === 240) tzName = 'UTC+4 (Dubai/Baku)'; else if (tzOffset === 300) tzName = 'UTC+5 (Karachi/Tashkent)'; else if (tzOffset === 330) tzName = 'UTC+5:30 (Mumbai/Delhi)'; else if (tzOffset === 360) tzName = 'UTC+6 (Dhaka/Almaty)'; else if (tzOffset === 420) tzName = 'UTC+7 (Bangkok/Jakarta)'; else if (tzOffset === 480) tzName = 'UTC+8 (Beijing/Singapore)'; else if (tzOffset === 540) tzName = 'UTC+9 (Tokyo/Seoul)'; else if (tzOffset === 570) tzName = 'UTC+9:30 (Adelaide)'; else if (tzOffset === 600) tzName = 'UTC+10 (Sydney/Melbourne)'; else if (tzOffset === 660) tzName = 'UTC+11 (Solomon Islands)'; else if (tzOffset === 720) tzName = 'UTC+12 (Fiji/Auckland)'; $('tz-value').textContent = tzName; var tzSelect = document.getElementById('tz-select'); if (tzSelect) tzSelect.value = tzOffset;";
   inner += "$('ntp-value').textContent = s.ntpServer; $('ntp-input').value = s.ntpServer;";
   inner += "var out=(s.output||{}), th=(s.thermal||{}), tof=(s.tof||{}), dbg=(s.debug||{});";
@@ -350,6 +371,7 @@ String getSettingsPage(const String& username) {
   // Chunk 4: UI actions
   inner += "<script>(function(){ try {";
   inner += "window.toggleWifi=function(){ var cur = ($('wifi-value').textContent==='Enabled')?1:0; var v=cur?0:1; var cmd='wifiautoreconnect '+v; fetch('/api/cli',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},credentials:'same-origin',body:'cmd='+encodeURIComponent(cmd)}).then(function(r){return r.text();}).then(function(t){ if(t.indexOf('Error')>=0){ alert(t); } refreshSettings(); }).catch(function(e){ alert('Error: '+e.message); }); };";
+  inner += "window.toggleEspNow=function(){ var cur = ($('espnow-value').textContent==='Enabled')?1:0; var v=cur?0:1; var cmd='set espnowenabled '+v; $('espnow-btn').textContent='...'; $('espnow-btn').disabled=true; fetch('/api/cli',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},credentials:'same-origin',body:'cmd='+encodeURIComponent(cmd)}).then(function(r){return r.text();}).then(function(t){ if(t.indexOf('Error')>=0){ alert(t); } else { if(v===1){ alert('ESP-NOW enabled. Will initialize on next reboot.'); } else { alert('ESP-NOW disabled. Will not initialize on next reboot.'); } } refreshSettings(); }).catch(function(e){ alert('Error: '+e.message); refreshSettings(); }); };";
   inner += "window.updateCliHistory=function(){ var v=parseInt($('cli-input').value); if(v<1){ alert('Must be at least 1'); return; } var cmd='clihistorysize '+v; fetch('/api/cli',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},credentials:'same-origin',body:'cmd='+encodeURIComponent(cmd)}).then(function(r){return r.text();}).then(function(){ refreshSettings(); }).catch(function(e){ alert('Error: '+e.message); }); };";
   inner += "window.clearCliHistory=function(){ var cmd='clear'; fetch('/api/cli',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},credentials:'same-origin',body:'cmd='+encodeURIComponent(cmd)}).then(function(r){return r.text();}).then(function(t){ try{ if(t && t.indexOf('Error')>=0){ alert(t); } else { console.debug('[Settings] CLI clear responded:', t); } }catch(_){ } if(typeof refreshSettings==='function') refreshSettings(); }).catch(function(e){ alert('Error: '+e.message); }); };";
   inner += "window.updateTimezone=function(){";

@@ -133,8 +133,8 @@ String getCLIPage(const String& username) {
   inner += "  if (window.__cliPoller) { try{ clearInterval(window.__cliPoller); }catch(_){} }\n";
   inner += "  window.__cliPoller = setInterval(function(){\n";
   inner += "    fetch('/api/cli/logs', { credentials: 'same-origin', cache: 'no-store' })\n";
-  inner += "      .then(function(r){ return r.text(); })\n";
-  inner += "      .then(function(text){ var t=__applyClear(text); t=__stripAnsi(t); if(cliOutput){ cliOutput.textContent = t || ''; try{ localStorage.setItem('cliOutputHistory', cliOutput.textContent); }catch(_){} } })\n";
+  inner += "      .then(function(r){ if(r.status===401){ if(window.__cliPoller){ clearInterval(window.__cliPoller); window.__cliPoller=null; } return ''; } return r.text(); })\n";
+  inner += "      .then(function(text){ if(text){ var t=__applyClear(text); t=__stripAnsi(t); if(cliOutput){ cliOutput.textContent = t || ''; try{ localStorage.setItem('cliOutputHistory', cliOutput.textContent); }catch(_){} } } })\n";
   inner += "      .catch(function(_){ });\n";
   inner += "  }, 500);\n"; // Changed from 1000 to 500
   inner += "} catch(e) { try{ console.debug('[CLI] polling init error: ' + e.message); }catch(_){} }";

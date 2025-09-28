@@ -9,53 +9,13 @@ String getDashboardPage(const String& username) {
   // Sensor Status Overview
   inner += "<div style='margin:2rem 0'>";
   inner += "<h3>Sensor Status</h3>";
-  inner += "<div class='sensor-status-grid' style='display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin:1rem 0'>";
-  
-  // IMU Sensor
-  inner += "<div class='sensor-status-card' style='background:rgba(255,255,255,0.1);border-radius:8px;padding:1rem;border:1px solid rgba(255,255,255,0.2)'>";
-  inner += "<div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem'>";
-  inner += "<span class='status-indicator status-disabled' id='dash-imu-status'></span>";
-  inner += "<strong>IMU (BNO055)</strong>";
+  inner += "<div id='sensor-loading' style='text-align:center;padding:2rem;color:#87ceeb'>";
+  inner += "<div style='font-size:1.1rem;margin-bottom:0.5rem'>Loading sensor status...</div>";
+  inner += "<div style='font-size:0.9rem;opacity:0.7'>Checking connected sensors</div>";
   inner += "</div>";
-  inner += "<div style='font-size:0.9rem;color:#87ceeb'>Gyroscope & Accelerometer</div>";
+  inner += "<div class='sensor-status-grid' id='sensor-grid' style='display:none;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin:1rem 0'>";
   inner += "</div>";
-  
-  // Thermal Camera
-  inner += "<div class='sensor-status-card' style='background:rgba(255,255,255,0.1);border-radius:8px;padding:1rem;border:1px solid rgba(255,255,255,0.2)'>";
-  inner += "<div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem'>";
-  inner += "<span class='status-indicator status-disabled' id='dash-thermal-status'></span>";
-  inner += "<strong>Thermal (MLX90640)</strong>";
-  inner += "</div>";
-  inner += "<div style='font-size:0.9rem;color:#87ceeb'>32x24 IR Camera</div>";
-  inner += "</div>";
-  
-  // ToF Distance Sensor
-  inner += "<div class='sensor-status-card' style='background:rgba(255,255,255,0.1);border-radius:8px;padding:1rem;border:1px solid rgba(255,255,255,0.2)'>";
-  inner += "<div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem'>";
-  inner += "<span class='status-indicator status-disabled' id='dash-tof-status'></span>";
-  inner += "<strong>ToF (VL53L4CX)</strong>";
-  inner += "</div>";
-  inner += "<div style='font-size:0.9rem;color:#87ceeb'>Distance Measurement</div>";
-  inner += "</div>";
-  
-  // RGB Gesture Sensor
-  inner += "<div class='sensor-status-card' style='background:rgba(255,255,255,0.1);border-radius:8px;padding:1rem;border:1px solid rgba(255,255,255,0.2)'>";
-  inner += "<div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem'>";
-  inner += "<span class='status-indicator status-disabled' id='dash-apds-status'></span>";
-  inner += "<strong>RGB (APDS-9960)</strong>";
-  inner += "</div>";
-  inner += "<div style='font-size:0.9rem;color:#87ceeb'>Color & Gesture</div>";
-  inner += "</div>";
-  
-  // Gamepad Controller
-  inner += "<div class='sensor-status-card' style='background:rgba(255,255,255,0.1);border-radius:8px;padding:1rem;border:1px solid rgba(255,255,255,0.2)'>";
-  inner += "<div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem'>";
-  inner += "<span class='status-indicator status-disabled' id='dash-gamepad-status'></span>";
-  inner += "<strong>Gamepad</strong>";
-  inner += "</div>";
-  inner += "<div style='font-size:0.9rem;color:#87ceeb'>Controller Input</div>";
-  inner += "</div>";
-  
+
   inner += "</div>"; // End sensor-status-grid
   inner += "</div>"; // End sensor status section
   
@@ -133,6 +93,29 @@ String getDashboardPage(const String& username) {
   inner += "      window.Dash.setIndicator('dash-gamepad-status', gameOn);";
   inner += "    }catch(e){ console.warn('[Dashboard] Sensor status update error', e); }";
   inner += "  };";
+  inner += "  window.Dash.updateDeviceVisibility = function(registry){";
+  inner += "    if(!registry || !registry.devices) return;";
+  inner += "    try{";
+  inner += "      var devices = registry.devices;";
+  inner += "      var hasIMU = devices.some(function(d){ return d.name === 'BNO055'; });";
+  inner += "      var hasThermal = devices.some(function(d){ return d.name === 'MLX90640'; });";
+  inner += "      var hasToF = devices.some(function(d){ return d.name === 'VL53L4CX'; });";
+  inner += "      var hasAPDS = devices.some(function(d){ return d.name === 'APDS9960'; });";
+  inner += "      var hasGamepad = devices.some(function(d){ return d.name === 'Seesaw'; });";
+  inner += "      var hasDRV = devices.some(function(d){ return d.name === 'DRV2605'; });";
+  inner += "      window.Dash.showHideCard('dash-imu-card', hasIMU);";
+  inner += "      window.Dash.showHideCard('dash-thermal-card', hasThermal);";
+  inner += "      window.Dash.showHideCard('dash-tof-card', hasToF);";
+  inner += "      window.Dash.showHideCard('dash-apds-card', hasAPDS);";
+  inner += "      window.Dash.showHideCard('dash-gamepad-card', hasGamepad);";
+  inner += "      window.Dash.showHideCard('dash-haptic-card', hasDRV);";
+  inner += "      console.log('[Dashboard] Device visibility updated - IMU:'+hasIMU+' Thermal:'+hasThermal+' ToF:'+hasToF+' APDS:'+hasAPDS+' Gamepad:'+hasGamepad+' Haptic:'+hasDRV);";
+  inner += "    }catch(e){ console.warn('[Dashboard] Device visibility update error', e); }";
+  inner += "  };";
+  inner += "  window.Dash.showHideCard = function(cardId, show){";
+  inner += "    var card = document.getElementById(cardId);";
+  inner += "    if(card) card.style.display = show ? 'block' : 'none';";
+  inner += "  };";
   inner += "  console.log('[Dashboard] Section 4a: updateSensorStatus added');";
   inner += "} else { console.error('[Dashboard] Section 4: Dash object not found!'); }";
   inner += "</script>";
@@ -185,22 +168,153 @@ String getDashboardPage(const String& username) {
   inner += "console.log('[Dashboard] Section 6a: Global variables set');";
   inner += "</script>";
   
-  // Section 6: Sensor Status Functions
+  // Section 6: Sensor Status Functions - Part 1
   inner += "<script>";
-  inner += "console.log('[Dashboard] Section 7: Adding sensor status functions');";
+  inner += "console.log('[Dashboard] Section 7a: Adding applySensorStatus function');";
   inner += "window.applySensorStatus = function(s){";
+  inner += "  console.log('[Dashboard] applySensorStatus called with:', s);";
   inner += "  if(!s) return;";
   inner += "  window.__sensorStatusSeq = s.seq || 0;";
+  inner += "};";
+  inner += "console.log('[Dashboard] Section 7a: applySensorStatus function added');";
+  inner += "</script>";
+  
+  // Section 6: Sensor Status Functions - Part 2  
+  inner += "<script>";
+  inner += "console.log('[Dashboard] Section 7b: Adding sensor card creation');";
+  inner += "window.createSensorCards = function(sensorStatus, deviceRegistry){";
+  inner += "  console.log('[Dashboard] createSensorCards called with status:', sensorStatus, 'registry:', deviceRegistry);";
+  inner += "  var loading = document.getElementById('sensor-loading');";
+  inner += "  var grid = document.getElementById('sensor-grid');";
+  inner += "  if(loading) loading.style.display = 'none';";
+  inner += "  if(grid) { grid.style.display = 'grid'; grid.innerHTML = ''; }";
+  inner += "  var availableSensors = window.getAvailableSensors(deviceRegistry);";
+  inner += "  console.log('[Dashboard] Available sensors from getAvailableSensors:', availableSensors);";
+  inner += "  var cardCount = 0;";
+  inner += "  for(var i = 0; i < availableSensors.length; i++){";
+  inner += "    var sensor = availableSensors[i];";
+  inner += "    var enabled = window.getSensorEnabled(sensor.key, sensorStatus);";
+  inner += "    var card = document.createElement('div');";
+  inner += "    card.className = 'sensor-status-card';";
+  inner += "    card.id = 'dash-' + sensor.key + '-card';";
+  inner += "    card.style.cssText = 'background:rgba(255,255,255,0.1);border-radius:8px;padding:1rem;border:1px solid rgba(255,255,255,0.2)';";
+  inner += "    var statusClass = enabled ? 'status-enabled' : 'status-disabled';";
+  inner += "    var statusText = enabled ? 'Running' : 'Available';";
+  inner += "    var statusColor = enabled ? '#28a745' : '#87ceeb';";
+  inner += "    card.innerHTML = '<div style=\"display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem\"><span class=\"status-indicator ' + statusClass + '\" id=\"dash-' + sensor.key + '-status\"></span><strong>' + sensor.name + '</strong><span style=\"margin-left:auto;font-size:0.8rem;color:' + statusColor + '\">' + statusText + '</span></div><div style=\"font-size:0.9rem;color:#87ceeb\">' + sensor.desc + '</div>';";
+  inner += "    grid.appendChild(card);";
+  inner += "    cardCount++;";
+  inner += "  }";
+  inner += "  if(cardCount === 0 && grid){";
+  inner += "    grid.innerHTML = '<div style=\"grid-column:1/-1;text-align:center;padding:2rem;color:#87ceeb;font-style:italic\">No sensors detected</div>';";
+  inner += "  }";
+  inner += "  console.log('[Dashboard] Created', cardCount, 'sensor cards');";
+  inner += "};";
+  inner += "console.log('[Dashboard] Section 7b: createSensorCards function added');";
+  inner += "</script>";
+  
+  // Section 6: Sensor Status Functions - Part 3
+  inner += "<script>";
+  inner += "console.log('[Dashboard] Section 7c: Adding helper functions');";
+  inner += "window.getAvailableSensors = function(deviceRegistry){";
+  inner += "  console.log('[Dashboard] getAvailableSensors called with:', deviceRegistry);";
+  inner += "  var sensors = [];";
+  inner += "  if(!deviceRegistry || !deviceRegistry.devices) {";
+  inner += "    console.log('[Dashboard] No device registry or devices array');";
+  inner += "    return sensors;";
+  inner += "  }";
+  inner += "  console.log('[Dashboard] Processing', deviceRegistry.devices.length, 'devices');";
+  inner += "  deviceRegistry.devices.forEach(function(device){";
+  inner += "    console.log('[Dashboard] Checking device:', device.name);";
+  inner += "    if(device.name === 'BNO055'){";
+  inner += "      sensors.push({key:'imu', name:'IMU (BNO055)', desc:'Gyroscope & Accelerometer'});";
+  inner += "      console.log('[Dashboard] Added IMU sensor');";
+  inner += "    } else if(device.name === 'MLX90640'){";
+  inner += "      sensors.push({key:'thermal', name:'Thermal (MLX90640)', desc:'32x24 IR Camera'});";
+  inner += "      console.log('[Dashboard] Added Thermal sensor');";
+  inner += "    } else if(device.name === 'VL53L4CX'){";
+  inner += "      sensors.push({key:'tof', name:'ToF (VL53L4CX)', desc:'Distance Measurement'});";
+  inner += "      console.log('[Dashboard] Added ToF sensor');";
+  inner += "    } else if(device.name === 'APDS-9960'){";
+  inner += "      sensors.push({key:'apds', name:'RGB (APDS-9960)', desc:'Color & Gesture'});";
+  inner += "      console.log('[Dashboard] Added APDS sensor');";
+  inner += "    } else if(device.name === 'DRV2605'){";
+  inner += "      sensors.push({key:'haptic', name:'Haptic (DRV2605)', desc:'Motor Driver'});";
+  inner += "      console.log('[Dashboard] Added Haptic sensor');";
+  inner += "    } else {";
+  inner += "      console.log('[Dashboard] Unknown device name:', device.name);";
+  inner += "    }";
+  inner += "  });";
+  inner += "  console.log('[Dashboard] getAvailableSensors returning', sensors.length, 'sensors:', sensors);";
+  inner += "  return sensors;";
+  inner += "};";
+  inner += "window.getSensorEnabled = function(key, status){";
+  inner += "  if(!status) return false;";
+  inner += "  if(key === 'imu') return !!status.imuEnabled;";
+  inner += "  if(key === 'thermal') return !!status.thermalEnabled;";
+  inner += "  if(key === 'tof') return !!status.tofEnabled;";
+  inner += "  if(key === 'apds') return !!(status.apdsColorEnabled || status.apdsProximityEnabled || status.apdsGestureEnabled);";
+  inner += "  if(key === 'haptic') return !!status.hapticEnabled;";
+  inner += "  return false;";
+  inner += "};";
+  inner += "console.log('[Dashboard] Section 7c: Helper functions added');";
+  inner += "</script>";
+  
+  // Section 6: Sensor Status Functions - Part 4
+  inner += "<script>";
+  inner += "console.log('[Dashboard] Section 7d: Updating applySensorStatus to use helpers');";
+  inner += "window.__deviceRegistry = null;";
+  inner += "window.applySensorStatus = function(s){";
+  inner += "  console.log('[Dashboard] applySensorStatus called with:', s);";
+  inner += "  if(!s) return;";
+  inner += "  window.__sensorStatusSeq = s.seq || 0;";
+  inner += "  if(window.__deviceRegistry){";
+  inner += "    console.log('[Dashboard] Using cached device registry:', window.__deviceRegistry);";
+  inner += "    window.createSensorCards(s, window.__deviceRegistry);";
+  inner += "  } else {";
+  inner += "    console.log('[Dashboard] Device registry not loaded yet, fetching...');";
+  inner += "    window.fetchDeviceRegistry().then(function(registry){ ";
+  inner += "      console.log('[Dashboard] Fetch complete, calling createSensorCards with:', registry);";
+  inner += "      window.createSensorCards(s, registry || window.__deviceRegistry); ";
+  inner += "    });";
+  inner += "  }";
   inner += "  if (window.Dash) window.Dash.updateSensorStatus(s);";
   inner += "};";
+  inner += "window.fetchDeviceRegistry = function(){";
+  inner += "  console.log('[Dashboard] fetchDeviceRegistry called');";
+  inner += "  return fetch('/api/devices', { credentials: 'include', cache: 'no-store' })";
+  inner += "    .then(function(r){ console.log('[Dashboard] Device registry fetch response:', r.status); return r.json(); })";
+  inner += "    .then(function(d){ ";
+  inner += "      console.log('[Dashboard] Setting window.__deviceRegistry to:', d);";
+  inner += "      window.__deviceRegistry = d; ";
+  inner += "      console.log('[Dashboard] Device registry loaded and stored:', window.__deviceRegistry);";
+  inner += "      if (window.Dash) window.Dash.updateDeviceVisibility(d);";
+  inner += "      return d;";
+  inner += "    })";
+  inner += "    .catch(function(e){ console.warn('[Dashboard] Device registry fetch failed:', e); return null; });";
+  inner += "};";
+  inner += "console.log('[Dashboard] Section 7d: applySensorStatus updated');";
+  inner += "</script>";
+  
+  // Section 6: Sensor Status Functions - Part 5
+  inner += "<script>";
+  inner += "console.log('[Dashboard] Section 7e: Adding fetchSensorStatus');";
   inner += "window.fetchSensorStatus = function(){";
   inner += "  console.log('[Dashboard] Fetching sensor status...');";
   inner += "  return fetch('/api/sensors/status', { credentials: 'include', cache: 'no-store' })";
   inner += "    .then(function(r){ console.log('[Dashboard] Sensor status response:', r.status); return r.json(); })";
-  inner += "    .then(function(j){ console.log('[Dashboard] Sensor status data:', j); window.applySensorStatus(j); })";
+  inner += "    .then(function(j){ ";
+  inner += "      console.log('[Dashboard] Raw sensor status data:', JSON.stringify(j, null, 2)); ";
+  inner += "      console.log('[Dashboard] Individual sensor states:');";
+  inner += "      console.log('  - imuEnabled:', j.imuEnabled);";
+  inner += "      console.log('  - thermalEnabled:', j.thermalEnabled);";
+  inner += "      console.log('  - tofEnabled:', j.tofEnabled);";
+  inner += "      console.log('  - apdsColorEnabled:', j.apdsColorEnabled);";
+  inner += "      window.applySensorStatus(j); ";
+  inner += "    })";
   inner += "    .catch(function(e){ console.warn('[Dashboard] sensor status fetch failed', e); });";
   inner += "};";
-  inner += "console.log('[Dashboard] Section 7a: Sensor status functions added');";
+  inner += "console.log('[Dashboard] Section 7e: fetchSensorStatus added');";
   inner += "</script>";
   
   // Section 7: SSE Functions
@@ -282,6 +396,7 @@ String getDashboardPage(const String& username) {
   // Section 9: Utility Functions
   inner += "<script>";
   inner += "console.log('[Dashboard] Section 10: Adding utility functions');";
+  // fetchDeviceRegistry is defined in Section 7d - don't duplicate it here";
   inner += "window.fetchSystemStatus = function(){";
   inner += "  console.log('[Dashboard] Fetching system status via API...');";
   inner += "  return fetch('/api/system', { credentials: 'include', cache: 'no-store' })";
@@ -310,6 +425,7 @@ String getDashboardPage(const String& username) {
   inner += "document.addEventListener('DOMContentLoaded', function(){";
   inner += "  try {";
   inner += "    console.log('[Dashboard] Section 11a: DOM loaded, initializing...');";
+  inner += "    if (window.fetchDeviceRegistry) window.fetchDeviceRegistry();";
   inner += "    if (window.fetchSensorStatus) window.fetchSensorStatus();";
   inner += "    if (window.fetchSystemStatus) window.fetchSystemStatus();";
   inner += "    if (window.createSSEIfNeeded) window.createSSEIfNeeded();";
