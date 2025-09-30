@@ -1,0 +1,13 @@
+{
+  "name": "Boot: greet and status",
+  "enabled": true,
+  "type": "afterDelay",
+  "delayMs": 0,
+  "runAtBoot": true,
+  "bootDelayMs": 2000,
+  "conditions": "", 
+  "commands": [
+    "broadcast System booted",
+    "status"
+  ]
+}
